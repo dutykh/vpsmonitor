@@ -25,7 +25,7 @@ A production-ready website monitoring solution for Ubuntu servers that checks we
 
 1. Clone the repository:
    ```bash
-   git clone <repository-url>
+   git clone https://github.com/dutykh/vpsmonitor
    cd vpsmonitor
    ```
 
