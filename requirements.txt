@@ -1,0 +1,13 @@
+# Website Monitor Dependencies
+# Author: Dr. Denys Dutykh (Khalifa University of Science and Technology, Abu Dhabi, UAE)
+
+# Core dependencies
+requests>=2.31.0
+python-dotenv>=1.0.0
+
+# Development dependencies (optional)
+pytest>=7.4.0
+pytest-cov>=4.1.0
+black>=23.0.0
+pylint>=2.17.0
+mypy>=1.5.0
