@@ -7,6 +7,7 @@ A production-ready website monitoring solution for Ubuntu servers that checks we
 ## Features
 
 - 🔍 Monitors multiple websites with configurable intervals
+- 🌐 API health endpoint monitoring with response validation
 - 📧 Email alerts with detailed error information
 - 🔄 Automatic retry logic with exponential backoff
 - 🛡️ SSL certificate validation
@@ -64,6 +65,7 @@ All configuration is managed through the `.env` file:
 | `SMTP_PASSWORD` | Email password/app password | Required |
 | `ALERT_EMAIL` | Where to send alerts | Required |
 | `WEBSITES` | Comma-separated URLs to monitor | Required |
+| `API_ENDPOINTS` | Semicolon-separated API configurations | Optional |
 | `CHECK_INTERVAL` | Seconds between checks | 300 |
 | `TIMEOUT` | Request timeout in seconds | 30 |
 | `ALERT_COOLDOWN` | Seconds between repeated alerts | 3600 |
@@ -82,6 +84,43 @@ Add comma-separated URLs to the `WEBSITES` variable:
 ```
 WEBSITES=https://site1.com,https://site2.com,https://site3.com
 ```
+
+## API Monitoring
+
+Monitor API health endpoints with response validation using the `API_ENDPOINTS` variable.
+
+### Configuration Format
+```
+API_ENDPOINTS=name|url|expected_status|expected_response_key:value,key2:value2
+```
+
+### Examples
+
+1. **Basic health check** (status code only):
+   ```
+   API_ENDPOINTS=MyAPI|http://127.0.0.1:8000/api/v1/health|200
+   ```
+
+2. **With response validation**:
+   ```
+   API_ENDPOINTS=GoogleScholarAPI|http://127.0.0.1:8000/api/v1/health|200|status:healthy,database:connected
+   ```
+
+3. **Multiple APIs** (semicolon-separated):
+   ```
+   API_ENDPOINTS=API1|http://127.0.0.1:8000/health|200|status:ok;API2|http://127.0.0.1:8001/status|200
+   ```
+
+4. **FastAPI example** (from your setup):
+   ```
+   API_ENDPOINTS=GoogleScholar|http://127.0.0.1:8000/api/v1/health|200|status:healthy,redis:connected,database:connected
+   ```
+
+### Response Validation
+- The monitor will check both HTTP status code and JSON response content
+- Response keys are checked for exact matches
+- Supported value types: strings, numbers, booleans (`true`/`false`)
+- If response validation fails, an alert will be sent
 
 ## Logs
 
