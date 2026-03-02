@@ -10,9 +10,12 @@ A production-ready website monitoring solution for Ubuntu servers that checks we
 - 🌐 API health endpoint monitoring with response validation
 - 📧 Email alerts with detailed error information
 - 🔄 Automatic retry logic with exponential backoff
+- ♻️ Resilient failure handling that honors retry budgets before alerting
 - 🛡️ SSL certificate validation
 - 📊 Response time tracking
 - 🚦 Rate-limited alerts to prevent spam
+- 🕒 UTC-normalized timestamps for accurate incident timelines
+- 🧭 Single-run and continuous service modes from the same entrypoint
 - 📝 Comprehensive logging
 - 🔐 Secure credential management
 
@@ -42,9 +45,14 @@ A production-ready website monitoring solution for Ubuntu servers that checks we
    nano .env  # Edit with your values
    ```
 
-4. Test the monitor:
+4. Test the monitor (single run, ideal for cron jobs):
    ```bash
    ./venv/bin/python monitor.py
+   ```
+
+   Run continuous monitoring in the foreground (useful for systemd/PM2/systemctl services):
+   ```bash
+   ./venv/bin/python monitor.py --continuous
    ```
 
 5. Set up automated monitoring with cron:
@@ -68,6 +76,7 @@ All configuration is managed through the `.env` file:
 | `API_ENDPOINTS` | Semicolon-separated API configurations | Optional |
 | `CHECK_INTERVAL` | Seconds between checks | 300 |
 | `TIMEOUT` | Request timeout in seconds | 30 |
+| `MAX_RETRIES` | Attempts per target before alerting | 3 |
 | `ALERT_COOLDOWN` | Seconds between repeated alerts | 3600 |
 
 ## Email Setup
@@ -113,8 +122,8 @@ API_ENDPOINTS=name|url|expected_status|expected_response_key:value,key2:value2
 
 4. **FastAPI example** (from your setup):
    ```
-   API_ENDPOINTS=GoogleScholar|http://127.0.0.1:8000/api/v1/health|200|status:healthy,redis:connected,database:connected
-   ```
+API_ENDPOINTS=GoogleScholar|http://127.0.0.1:8000/api/v1/health|200|status:healthy,redis:connected,database:connected
+```
 
 ### Response Validation
 - The monitor will check both HTTP status code and JSON response content
@@ -122,12 +131,27 @@ API_ENDPOINTS=name|url|expected_status|expected_response_key:value,key2:value2
 - Supported value types: strings, numbers, booleans (`true`/`false`)
 - If response validation fails, an alert will be sent
 
+## Running Modes & Scheduling
+
+- `./venv/bin/python monitor.py` performs a single pass. This is the safest mode for cron because the process exits after finishing.
+- `./venv/bin/python monitor.py --continuous` keeps looping using the configured `CHECK_INTERVAL`, making it suitable for long-running services managed by systemd, PM2, Docker, or screen/tmux.
+
+Both modes share the same configuration and logging directories, so alert cooldowns and histories remain consistent regardless of how you launch the monitor.
+
 ## Logs
 
 Logs are stored in the `logs/` directory:
 - `monitor_YYYYMMDD.log` - Daily application logs
 - `cron.log` - Cron execution logs
 - `alert_history.json` - Alert rate limiting data
+
+All logged timestamps are normalized to UTC. If you previously ran older versions that wrote naive timestamps, the monitor automatically backfills timezone information the next time an alert fires.
+
+## Alerting & Reliability
+
+- Each check uses exponential backoff and respects `MAX_RETRIES`, reducing false positives from transient HTTP issues.
+- Alert emails contain UTC timestamps, response metrics, and platform-agnostic remediation steps so they remain relevant across different deployments.
+- Cooldowns are persisted in `logs/alert_history.json`; deleting the file resets the history if you need a clean slate.
 
 ## Troubleshooting
 
@@ -153,6 +177,17 @@ Logs are stored in the `logs/` directory:
 - Never commit `.env` to version control
 - Use app-specific passwords for email
 - Regularly update dependencies: `pip install --upgrade -r requirements.txt`
+
+## Project Evolution
+
+The monitor started as a lightweight cron helper and has evolved into a more robust service that:
+
+- Supports both website and JSON API probes with content validation.
+- Persists alert history and emits UTC-aware telemetry for easier cross-region incident response.
+- Offers a unified CLI for one-shot runs, cron usage, or daemon-like continuous monitoring.
+- Provides opinionated yet deployment-agnostic remediation hints inside alert emails.
+
+These improvements came from real-world operations feedback; feel free to open issues or PRs if you need additional platform integrations.
 
 ## Contributing
 

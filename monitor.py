@@ -6,13 +6,13 @@ Monitors multiple websites and sends email alerts on failures
 Author: Dr. Denys Dutykh (Khalifa University of Science and Technology, Abu Dhabi, UAE)
 """
 
+import argparse
 import os
-import sys
 import time
 import logging
 import smtplib
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -177,6 +177,7 @@ class WebsiteChecker:
         """
         attempt = 0
         last_error = None
+        last_details: Optional[Dict] = None
         
         while attempt < self.config.max_retries:
             try:
@@ -188,16 +189,23 @@ class WebsiteChecker:
                     allow_redirects=True
                 )
                 response_time = round((time.time() - start_time) * 1000, 2)
+                timestamp = datetime.now(timezone.utc).isoformat()
                 
                 is_healthy = (200 <= response.status_code < 400) or response.status_code == 429
-                
-                return is_healthy, {
+                details = {
                     'status_code': response.status_code,
                     'response_time_ms': response_time,
                     'error': None,
                     'ssl_valid': True,
-                    'timestamp': datetime.now().isoformat()
+                    'timestamp': timestamp
                 }
+                
+                if is_healthy:
+                    return True, details
+                
+                last_error = f"Unexpected status code: {response.status_code}"
+                details['error'] = last_error
+                last_details = details
                 
             except SSLError as e:
                 last_error = f"SSL Error: {str(e)}"
@@ -219,12 +227,15 @@ class WebsiteChecker:
             if attempt < self.config.max_retries:
                 time.sleep(2 ** attempt)  # Exponential backoff
         
+        if last_details:
+            return False, last_details
+        
         return False, {
             'status_code': None,
             'response_time_ms': None,
             'error': last_error,
             'ssl_valid': 'SSL' not in last_error if last_error else None,
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.now(timezone.utc).isoformat()
         }
 
 class APIChecker:
@@ -250,6 +261,7 @@ class APIChecker:
         
         attempt = 0
         last_error = None
+        last_details: Optional[Dict] = None
         
         while attempt < self.config.max_retries:
             try:
@@ -261,6 +273,7 @@ class APIChecker:
                     allow_redirects=False
                 )
                 response_time = round((time.time() - start_time) * 1000, 2)
+                timestamp = datetime.now(timezone.utc).isoformat()
                 
                 # Check status code
                 status_ok = response.status_code == expected_status
@@ -280,14 +293,19 @@ class APIChecker:
                         response_data = {"error": "Invalid JSON response"}
                 
                 is_healthy = status_ok and content_ok
-                
-                return is_healthy, {
+                details = {
                     'status_code': response.status_code,
                     'response_time_ms': response_time,
                     'error': None if is_healthy else f"Status: {response.status_code}, Content: {response_data}",
                     'response_data': response_data,
-                    'timestamp': datetime.now().isoformat()
+                    'timestamp': timestamp
                 }
+                
+                if is_healthy:
+                    return True, details
+                
+                last_error = details['error']
+                last_details = details
                 
             except Timeout:
                 last_error = f"Timeout after {self.config.timeout} seconds"
@@ -305,12 +323,15 @@ class APIChecker:
             if attempt < self.config.max_retries:
                 time.sleep(2 ** attempt)  # Exponential backoff
         
+        if last_details:
+            return False, last_details
+        
         return False, {
             'status_code': None,
             'response_time_ms': None,
             'error': last_error,
             'response_data': None,
-            'timestamp': datetime.now().isoformat()
+            'timestamp': datetime.now(timezone.utc).isoformat()
         }
 
 class EmailNotifier:
@@ -347,9 +368,11 @@ class EmailNotifier:
             return True
         
         last_alert = datetime.fromisoformat(self.alert_history[url])
+        if last_alert.tzinfo is None:
+            last_alert = last_alert.replace(tzinfo=timezone.utc)
         cooldown_expires = last_alert + timedelta(seconds=self.config.alert_cooldown)
         
-        return datetime.now() > cooldown_expires
+        return datetime.now(timezone.utc) > cooldown_expires
     
     def send_alert(self, url: str, details: Dict, is_api: bool = False) -> bool:
         """Send email alert for website/API issue"""
@@ -365,7 +388,7 @@ class EmailNotifier:
                 server.login(self.config.smtp_username, self.config.smtp_password)
                 server.send_message(msg)
             
-            self.alert_history[url] = datetime.now().isoformat()
+            self.alert_history[url] = datetime.now(timezone.utc).isoformat()
             self._save_alert_history()
             
             self.logger.info(f"Alert sent for {url}")
@@ -381,12 +404,14 @@ class EmailNotifier:
         msg['From'] = self.config.smtp_username
         msg['To'] = self.config.alert_email
         
+        timestamp = datetime.now(timezone.utc)
+        pretty_timestamp = timestamp.strftime('%Y-%m-%d %H:%M:%S UTC')
         if is_api:
             msg['Subject'] = f"[ALERT] API Issue: {url}"
             body = f"""
 API Monitoring Alert
 --------------------
-Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
+Time: {pretty_timestamp}
 API Endpoint: {url}
 Status: DOWN
 
@@ -397,11 +422,10 @@ Error Details:
 - Response Data: {json.dumps(details.get('response_data', {}), indent=2)}
 
 Recommended Actions:
-1. Check if the API service is running (systemctl status google-scholar-api)
-2. Check API logs (journalctl -u google-scholar-api -n 50)
-3. Verify Redis is running (systemctl status redis-startup)
-4. Check database connectivity
-5. Review recent API deployments or changes
+1. Confirm the API process/service is running
+2. Inspect API logs for recent errors
+3. Validate dependencies (databases, caches, upstream services)
+4. Review recent deployments or configuration changes
 
 This is an automated alert from your API monitoring system.
             """
@@ -410,7 +434,7 @@ This is an automated alert from your API monitoring system.
             body = f"""
 Website Monitoring Alert
 ------------------------
-Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
+Time: {pretty_timestamp}
 Website: {url}
 Status: DOWN
 
@@ -421,10 +445,10 @@ Error Details:
 - SSL Valid: {details.get('ssl_valid', 'Unknown')}
 
 Recommended Actions:
-1. Check if the website is accessible from your browser
-2. Verify server status and logs
-3. Check PM2 process status if applicable
-4. Review recent deployments or changes
+1. Confirm the site is accessible from multiple networks
+2. Check web server/process status and logs
+3. Validate SSL certificate status and domain configuration
+4. Review recent deployments or infrastructure changes
 
 This is an automated alert from your website monitoring system.
             """
@@ -446,7 +470,10 @@ class WebsiteMonitor:
     def run_checks(self):
         """Run health checks for all configured websites and APIs"""
         total_checks = len(self.config.websites) + len(self.config.api_endpoints)
-        self.logger.info(f"Running checks for {len(self.config.websites)} websites and {len(self.config.api_endpoints)} APIs")
+        self.logger.info(
+            f"Running {total_checks} checks "
+            f"({len(self.config.websites)} websites, {len(self.config.api_endpoints)} APIs)"
+        )
         
         # Check websites
         for url in self.config.websites:
@@ -502,15 +529,24 @@ class WebsiteMonitor:
                 self.logger.critical(f"Critical error: {e}", exc_info=True)
                 time.sleep(60)  # Wait before retrying
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Website and API monitoring service")
+    parser.add_argument(
+        "--continuous",
+        action="store_true",
+        help="Run continuous monitoring loop instead of a single pass"
+    )
+    return parser.parse_args()
+
+
 def main():
     """Main entry point"""
+    args = parse_args()
     monitor = WebsiteMonitor()
     
-    # Check if running from cron (single check) or continuous
-    if len(sys.argv) > 1 and sys.argv[1] == "--once":
-        monitor.run_once()
+    if args.continuous:
+        monitor.run_continuous()
     else:
-        # For cron, we typically want single execution
         monitor.run_once()
 
 if __name__ == "__main__":
