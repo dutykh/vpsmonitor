@@ -3,6 +3,7 @@
 
 # Environment variables
 .env
+.env.bak-*
 
 # Python
 __pycache__/

@@ -189,7 +189,7 @@ class WebsiteChecker:
                 )
                 response_time = round((time.time() - start_time) * 1000, 2)
                 
-                is_healthy = 200 <= response.status_code < 400
+                is_healthy = (200 <= response.status_code < 400) or response.status_code == 429
                 
                 return is_healthy, {
                     'status_code': response.status_code,
