@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Refuse to commit real credentials to what is a PUBLIC repository.
+# Author: Dr. Denys Dutykh
+set -euo pipefail
+
+fail() { echo "pre-commit: $1" >&2; exit 1; }
+
+# Never allow these files to be staged at all.
+if git diff --cached --name-only | grep -qE '^\.env$|^\.env\.bak|^data/|\.db$'; then
+    fail "refusing to commit .env, a backup of it, or the state database."
+fi
+
+# Catch a real secret pasted into any staged file (placeholders are allowed).
+if git diff --cached -U0 | grep -qE '^\+.*(SMTP_PASSWORD|SMTP_USERNAME)=' ; then
+    if git diff --cached -U0 | grep -E '^\+.*SMTP_PASSWORD=' \
+        | grep -qvE 'your-app-specific-password|<[^>]+>|xxx|changeme|example'; then
+        fail "a non-placeholder SMTP_PASSWORD appears in the staged changes."
+    fi
+fi
+exit 0

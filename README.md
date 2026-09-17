@@ -1,202 +1,289 @@
 # Website Monitor
 
-A production-ready website monitoring solution for Ubuntu servers that checks website availability and sends email alerts when issues are detected.
+Website, API and TLS certificate monitoring for Linux servers, with incident
+tracking and grouped email alerts. Single file, standard library plus two
+dependencies, no daemon required.
 
 **Author:** Dr. Denys Dutykh (Khalifa University of Science and Technology, Abu Dhabi, UAE)
+**License:** GPL-3.0
+
+---
 
 ## Features
 
-- 🔍 Monitors multiple websites with configurable intervals
-- 🌐 API health endpoint monitoring with response validation
-- 📧 Email alerts with detailed error information
-- 🔄 Automatic retry logic with exponential backoff
-- ♻️ Resilient failure handling that honors retry budgets before alerting
-- 🛡️ SSL certificate validation
-- 📊 Response time tracking
-- 🚦 Rate-limited alerts to prevent spam
-- 🕒 UTC-normalized timestamps for accurate incident timelines
-- 🧭 Single-run and continuous service modes from the same entrypoint
-- 📝 Comprehensive logging
-- 🔐 Secure credential management
+- **Website and JSON API monitoring** with status, content and response-validation checks
+- **Incident tracking** — an outage is a first-class object with a start, an end and a duration
+- **Recovery alerts** — you are told when a site comes back, and how long it was out
+- **Escalating re-alerts** (1h, 2h, 4h, 8h, 12h, then daily) instead of a flat cooldown
+- **Grouped alerts** — `example.com` and `www.example.com` arrive as one email, not two
+- **TLS expiry warnings** at 21/14/7/3/1 days, independent of whatever issues your certificates
+- **Uptime history in SQLite** — real uptime percentages, p95 latency and incident history
+- **Daily/weekly summary emails** built from that history
+- **Concurrent checks** with a configurable worker pool
+- **Dead-man's switch** — an outbound heartbeat so you learn if the monitor itself dies
+- **Single-instance locking**, so overlapping runs can never double-alert or race state
+- **Automatic log rotation** and database retention
 
 ## Requirements
 
-- Ubuntu 22.04 (or compatible Linux distribution)
-- Python 3.8+
-- Email account with SMTP access (Gmail, etc.)
+- Linux (developed on Ubuntu 22.04)
+- **Python 3.11+** (`tomllib` is used for the optional TOML config)
+- An SMTP account for alerts
 
-## Quick Start
+## Quick start
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/dutykh/vpsmonitor
-   cd vpsmonitor
-   ```
+```bash
+git clone https://github.com/dutykh/vpsmonitor
+cd vpsmonitor
+./install.sh                  # creates venv, installs runtime deps, chmod 600 .env
+nano .env                     # SMTP credentials, ALERT_EMAIL, WEBSITES
+./venv/bin/python monitor.py --test-email
+./venv/bin/python monitor.py --dry-run --verbose
+```
 
-2. Run the installation script:
-   ```bash
-   chmod +x install.sh
-   ./install.sh
-   ```
+Then schedule it (`crontab -e`):
 
-3. Configure your settings:
-   ```bash
-   cp .env.example .env
-   nano .env  # Edit with your values
-   ```
+```cron
+# Checks every 5 minutes - safe, because runs are lock-guarded
+*/5 * * * * cd /path/to/vpsmonitor && ./venv/bin/python monitor.py >> logs/cron.log 2>&1
 
-4. Test the monitor (single run, ideal for cron jobs):
-   ```bash
-   ./venv/bin/python monitor.py
-   ```
+# Daily uptime summary at 08:00
+0 8 * * * cd /path/to/vpsmonitor && ./venv/bin/python monitor.py --report daily >> logs/cron.log 2>&1
+```
 
-   Run continuous monitoring in the foreground (useful for systemd/PM2/systemctl services):
-   ```bash
-   ./venv/bin/python monitor.py --continuous
-   ```
+systemd timers are provided in `systemd/` as an alternative (`Persistent=true`
+catches up after downtime; `RandomizedDelaySec` avoids hitting every host on the
+same second).
 
-5. Set up automated monitoring with cron:
-   ```bash
-   crontab -e
-   # Add: */5 * * * * cd /path/to/vpsmonitor && ./venv/bin/python monitor.py
-   ```
+## Command line
+
+| Command | Purpose |
+|---------|---------|
+| `monitor.py` | One check pass, then exit. The mode to use from cron. |
+| `monitor.py --continuous` | Loop forever using `CHECK_INTERVAL`. For systemd/PM2/Docker. |
+| `monitor.py --status` | Print current up/down state, uptime and certificate expiry. |
+| `monitor.py --report daily\|weekly\|monthly` | Email an uptime summary. |
+| `monitor.py --check URL` | Probe one URL and print JSON. No config, no state, no email. |
+| `monitor.py --test-email` | Verify SMTP settings end to end. |
+| `monitor.py --notify "Subject" --body-file F` | Send an arbitrary message (for other scripts). |
+| `monitor.py --dry-run` | Run checks and update state, but never send email. |
+| `monitor.py -v` / `-q` | More / less console output. |
 
 ## Configuration
 
-All configuration is managed through the `.env` file:
+Everything lives in `.env` (see `.env.example`). Targets may optionally be moved
+to a `targets.toml` file for per-target options.
+
+### Email
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `SMTP_SERVER` | SMTP server address | smtp.gmail.com |
-| `SMTP_PORT` | SMTP server port | 587 |
-| `SMTP_USERNAME` | Email username | Required |
-| `SMTP_PASSWORD` | Email password/app password | Required |
-| `ALERT_EMAIL` | Where to send alerts | Required |
-| `WEBSITES` | Comma-separated URLs to monitor | Required |
-| `API_ENDPOINTS` | Semicolon-separated API configurations | Optional |
-| `CHECK_INTERVAL` | Seconds between checks | 300 |
-| `TIMEOUT` | Request timeout in seconds | 30 |
-| `MAX_RETRIES` | Attempts per target before alerting | 3 |
-| `ALERT_COOLDOWN` | Seconds between repeated alerts | 3600 |
+| `SMTP_SERVER` | SMTP host | `smtp.gmail.com` |
+| `SMTP_PORT` | SMTP port | `587` |
+| `SMTP_SECURITY` | `starttls`, `ssl` (port 465) or `plain` | `starttls` |
+| `SMTP_USERNAME` | Username / from-address | *required* |
+| `SMTP_PASSWORD` | Password or app-specific password | *required* |
+| `ALERT_EMAIL` | Recipient(s), comma-separated | *required* |
+| `SMTP_TIMEOUT` | Seconds before giving up on the SMTP server | `30` |
 
-## Email Setup
+### Targets
+
+| Variable | Description |
+|----------|-------------|
+| `WEBSITES` | Comma-separated URLs |
+| `API_ENDPOINTS` | `name\|url\|expected_status\|key:value,...`, semicolon-separated |
+| `TARGETS_FILE` | Path to a `targets.toml` (overrides the two above) |
+
+### Behaviour
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `TIMEOUT` | Per-request timeout, seconds | `30` |
+| `MAX_RETRIES` | Attempts per target before declaring it down | `3` |
+| `MAX_WORKERS` | Parallel checks (`1` = sequential) | `8` |
+| `CHECK_INTERVAL` | Seconds between passes in `--continuous` mode only | `300` |
+| `FAILURE_THRESHOLD` | Consecutive failed passes before alerting | `1` |
+| `ALERT_COOLDOWN` | Delay before the *first* re-alert; later ones escalate | `3600` |
+| `GROUP_ALERTS` | Coalesce same-domain targets into one email | `true` |
+| `SLOW_THRESHOLD_MS` | Warn above this 24h p95 latency (`0` disables) | `0` |
+| `SSL_CHECK_ENABLED` | Check certificate expiry | `true` |
+| `SSL_WARN_DAYS` | Warning thresholds, in days | `21,14,7,3,1` |
+| `HEARTBEAT_URL` | Dead-man's-switch ping URL | *(empty)* |
+| `LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR` | `INFO` |
+| `LOG_RETENTION_DAYS` | Days of uncompressed daily logs | `90` |
+| `LOG_ARCHIVE_DAYS` | Days before gzipped logs are deleted | `365` |
+| `DB_RETENTION_DAYS` | Days of raw check rows before roll-up | `90` |
 
 ### Gmail
-1. Enable 2-factor authentication
-2. Generate an app-specific password: https://myaccount.google.com/apppasswords
-3. Use your Gmail address as `SMTP_USERNAME`
-4. Use the app password as `SMTP_PASSWORD`
 
-## Monitoring Multiple Sites
+1. Enable two-factor authentication.
+2. Create an app password at <https://myaccount.google.com/apppasswords>.
+3. Use your address as `SMTP_USERNAME` and the app password as `SMTP_PASSWORD`.
 
-Add comma-separated URLs to the `WEBSITES` variable:
+## API monitoring
+
 ```
-WEBSITES=https://site1.com,https://site2.com,https://site3.com
-```
-
-## API Monitoring
-
-Monitor API health endpoints with response validation using the `API_ENDPOINTS` variable.
-
-### Configuration Format
-```
-API_ENDPOINTS=name|url|expected_status|expected_response_key:value,key2:value2
+API_ENDPOINTS=name|url|expected_status|key:value,key2:value2
 ```
 
-### Examples
+Records are separated by `;`. Values are coerced to booleans, integers and floats
+where unambiguous. Both the status code and every listed JSON field must match.
 
-1. **Basic health check** (status code only):
-   ```
-   API_ENDPOINTS=MyAPI|http://127.0.0.1:8000/api/v1/health|200
-   ```
+```bash
+# Status code only
+API_ENDPOINTS=MyAPI|http://127.0.0.1:8000/api/v1/health|200
 
-2. **With response validation**:
-   ```
-   API_ENDPOINTS=GoogleScholarAPI|http://127.0.0.1:8000/api/v1/health|200|status:healthy,database:connected
-   ```
+# With response validation
+API_ENDPOINTS=Scholar|http://127.0.0.1:8000/api/v1/health|200|status:healthy,cache:connected,database:connected
 
-3. **Multiple APIs** (semicolon-separated):
-   ```
-   API_ENDPOINTS=API1|http://127.0.0.1:8000/health|200|status:ok;API2|http://127.0.0.1:8001/status|200
-   ```
-
-4. **FastAPI example** (from your setup):
-   ```
-API_ENDPOINTS=GoogleScholar|http://127.0.0.1:8000/api/v1/health|200|status:healthy,redis:connected,database:connected
+# Several endpoints
+API_ENDPOINTS=A|http://127.0.0.1:8000/health|200|status:ok;B|http://127.0.0.1:8001/status|200
 ```
 
-### Response Validation
-- The monitor will check both HTTP status code and JSON response content
-- Response keys are checked for exact matches
-- Supported value types: strings, numbers, booleans (`true`/`false`)
-- If response validation fails, an alert will be sent
+A malformed record is **reported in the log**, not silently ignored.
 
-## Running Modes & Scheduling
+## Richer configuration with `targets.toml`
 
-- `./venv/bin/python monitor.py` performs a single pass. This is the safest mode for cron because the process exits after finishing.
-- `./venv/bin/python monitor.py --continuous` keeps looping using the configured `CHECK_INTERVAL`, making it suitable for long-running services managed by systemd, PM2, Docker, or screen/tmux.
+Copy `targets.toml.example` to `targets.toml` when you need per-target options —
+content checks, custom headers, methods, per-target timeouts:
 
-Both modes share the same configuration and logging directories, so alert cooldowns and histories remain consistent regardless of how you launch the monitor.
+```toml
+[[website]]
+name   = "Main site"
+url    = "https://example.com"
+expect = "Welcome to Example"     # catches "HTTP 200 but the page is broken"
 
-## Logs
+[[api]]
+name            = "Scholar API"
+url             = "http://127.0.0.1:8000/api/v1/health"
+expected_status = 200
+[api.expected_response]
+status   = "healthy"
+database = "connected"
+```
 
-Logs are stored in the `logs/` directory:
-- `monitor_YYYYMMDD.log` - Daily application logs
-- `cron.log` - Cron execution logs
-- `alert_history.json` - Alert rate limiting data
+Parsed with the standard library's `tomllib`. If the file is absent the `.env`
+variables are used exactly as before.
 
-All logged timestamps are normalized to UTC. If you previously ran older versions that wrote naive timestamps, the monitor automatically backfills timezone information the next time an alert fires.
+## How alerting works
 
-## Alerting & Reliability
+A target is either **up** or **down**. A transition creates or closes an
+**incident**, and email follows from the incident, never from a per-URL timer.
 
-- Each check uses exponential backoff and respects `MAX_RETRIES`, reducing false positives from transient HTTP issues.
-- Alert emails contain UTC timestamps, response metrics, and platform-agnostic remediation steps so they remain relevant across different deployments.
-- Cooldowns are persisted in `logs/alert_history.json`; deleting the file resets the history if you need a clean slate.
+1. **Goes down** → an incident opens and an alert is sent immediately.
+2. **Stays down** → re-alerts follow an escalating ladder: +1h, +3h, +7h, +15h,
+   +27h, +51h, then daily. A 30-hour outage produces 6 emails, not 30.
+3. **Comes back** → the incident closes and a **RESOLVED** email reports the
+   duration. The alert state is destroyed with the incident, so a *new* outage
+   ten minutes later alerts immediately.
+4. **Grouping** — every alert raised in one pass is coalesced by registrable
+   domain, so apex and `www` twins arrive as a single email that still lists each
+   target separately.
+
+Guards against false alarms:
+
+- **Overlap** — a second run exits cleanly if one is already in progress.
+- **Monitoring gaps** — after a long silence, alerts carry a banner saying outage
+  start times are lower bounds.
+- **Monitor-side failure** — if ≥80% of targets fail at once with DNS/connection
+  errors, the alert is re-titled to say the monitoring host is the likely cause.
+- **Cold start** — the first run after installation records pre-existing failures
+  without paging you about all of them at once.
+- **Flap detection** — a target oscillating up and down is reported once rather
+  than on every transition.
+
+## TLS certificates
+
+Expiry is probed directly over a TLS handshake, at most once every 12 hours per
+host, and warnings fire at `SSL_WARN_DAYS` thresholds (each threshold once).
+
+This is deliberately independent of whatever renews your certificates. If ACME
+renewal silently stops — a permissions problem on the account file, a rate limit,
+a failed challenge — nothing else will tell you until browsers start showing
+warnings. `monitor.py --status` shows days remaining for every monitored host.
+
+## Data and logs
+
+```
+logs/monitor_YYYYMMDD.log   daily application log, rotated and gzipped
+logs/cron.log               only warnings and errors (see below)
+data/monitor.db             SQLite: checks, incidents, certificates, runs
+```
+
+Console output is **TTY-aware**: colours only on a terminal, and under cron only
+warnings and above reach stdout. A healthy run therefore writes nothing to
+`cron.log`. Timestamps in the database are UTC; log filenames use local dates.
+
+Retention is automatic — raw check rows are rolled into daily aggregates after
+`DB_RETENTION_DAYS` and the database is vacuumed monthly, so the uptime history
+is permanent while storage stays flat.
+
+To back the database up, use `VACUUM INTO` rather than `cp` (a plain copy of a
+WAL-mode database loses the write-ahead log):
+
+```cron
+23 3 * * * sqlite3 /path/to/vpsmonitor/data/monitor.db "VACUUM INTO '/backups/monitor-$(date +\%F).db'"
+```
+
+## Reusing the alert channel from other scripts
+
+`--notify` lets any script send mail through the monitor's configured SMTP
+account without duplicating credentials:
+
+```bash
+./venv/bin/python monitor.py --notify "[SECURITY] watchdog alert on $(hostname)" \
+                             --body-file /home/dds/logs/security-watchdog.log
+```
+
+## Development
+
+```bash
+make dev      # development virtualenv (kept out of the production one)
+make test     # pytest
+make cov      # coverage report
+make lint     # pylint + mypy
+make check    # everything CI runs
+```
+
+The production virtualenv holds only `requests` and `python-dotenv` (~17 MB).
+Development tooling lives in `requirements-dev.txt` and a separate `.venv-dev`.
 
 ## Troubleshooting
 
-### No alerts received
-1. Check SMTP credentials in `.env`
-2. Verify alert email address
-3. Check logs for errors: `tail -f logs/monitor_*.log`
-4. Test email manually: `./venv/bin/python -c "from monitor import *; monitor = WebsiteMonitor(); monitor.run_once()"`
+**No alerts arriving**
+1. `./venv/bin/python monitor.py --test-email`
+2. Check `logs/monitor_$(date +%Y%m%d).log`
+3. `./venv/bin/python monitor.py --status` — are the targets actually down?
+4. Gmail app passwords are revoked when the account password changes.
 
-### False positives
-1. Increase `TIMEOUT` value
-2. Check if website requires specific headers
-3. Verify SSL certificates are valid
+**Too many alerts** — raise `FAILURE_THRESHOLD` to require consecutive failed
+passes, or `ALERT_COOLDOWN` to stretch the escalation ladder.
 
-### High resource usage
-1. Increase `CHECK_INTERVAL`
-2. Reduce `MAX_RETRIES`
-3. Check for memory leaks in logs
+**False positives** — raise `TIMEOUT`, or add an `expect` string if the site
+returns a valid but unhelpful page.
+
+**A run seems to be skipped** — that is the single-instance lock. Look for
+"another monitor run is already in progress" in the log.
 
 ## Security
 
-- Store `.env` with restricted permissions: `chmod 600 .env`
-- Never commit `.env` to version control
-- Use app-specific passwords for email
-- Regularly update dependencies: `pip install --upgrade -r requirements.txt`
-
-## Project Evolution
-
-The monitor started as a lightweight cron helper and has evolved into a more robust service that:
-
-- Supports both website and JSON API probes with content validation.
-- Persists alert history and emits UTC-aware telemetry for easier cross-region incident response.
-- Offers a unified CLI for one-shot runs, cron usage, or daemon-like continuous monitoring.
-- Provides opinionated yet deployment-agnostic remediation hints inside alert emails.
-
-These improvements came from real-world operations feedback; feel free to open issues or PRs if you need additional platform integrations.
+- `.env` is `chmod 600` and git-ignored; `install.sh` enforces both and refuses
+  to proceed if `.env` is not ignored.
+- A `pre-commit` hook (`.githooks/`, enabled by `install.sh`) blocks commits
+  containing a real `SMTP_PASSWORD`, `.env`, or the database.
+- CI fails if credentials or `data/` ever become tracked.
+- Alert emails redact response fields matching `token|secret|key|password` and
+  truncate bodies, so API internals are not mailed in cleartext.
+- Use an app-specific password, never your main account password.
+- `data/` is `chmod 700` — it holds an inventory of your infrastructure.
 
 ## Contributing
 
-1. Fork the repository
-2. Create a feature branch
-3. Add tests for new functionality
-4. Ensure code passes linting
-5. Submit a pull request
+1. Fork and branch.
+2. `make check` must pass.
+3. Add tests for new behaviour — especially anything touching alert scheduling.
+4. Open a pull request.
 
 ## License
 
-GPL-3.0 License - See LICENSE file for details
+GPL-3.0 — see [LICENSE](LICENSE).

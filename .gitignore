@@ -37,6 +37,19 @@ ENV/
 logs/
 *.log
 
+# State database (never commit - contains monitored infrastructure inventory)
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Local target configuration (may name private hosts)
+targets.toml
+
+# Local backups of the old implementation
+*.v1-backup
+.venv-dev/
+
 # IDE
 .vscode/
 .idea/

@@ -1,0 +1,20 @@
+[Unit]
+Description=Website Monitor - single check pass
+Documentation=https://github.com/dutykh/vpsmonitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/tools/vpsmonitor
+ExecStart=%h/tools/vpsmonitor/venv/bin/python %h/tools/vpsmonitor/monitor.py
+# The app writes its own rotated logs; journald captures warnings and errors.
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=600
+# Hardening: this process only needs to read its own directory and reach the network.
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/tools/vpsmonitor/logs %h/tools/vpsmonitor/data
+NoNewPrivileges=true

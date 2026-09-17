@@ -1,74 +1,104 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # install.sh - Installation script for Website Monitor
 # Author: Dr. Denys Dutykh (Khalifa University of Science and Technology, Abu Dhabi, UAE)
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$HERE"
+
+DEV=0
+[[ "${1:-}" == "--dev" ]] && DEV=1
 
 echo "==================================="
-echo "Website Monitor Installation Script"
+echo "Website Monitor Installation"
 echo "==================================="
 
-# Check Python version
-python_version=$(python3 --version 2>&1 | awk '{print $2}')
-required_version="3.8"
-
-if ! python3 -c "import sys; exit(0 if sys.version_info >= (3, 8) else 1)"; then
-    echo "Error: Python 3.8+ is required. Found: $python_version"
+# --- Python version -------------------------------------------------------
+# 3.11+ is required for tomllib (used for the optional targets.toml).
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "Error: python3 not found on PATH." >&2
     exit 1
 fi
+python_version="$(python3 --version 2>&1 | awk '{print $2}')"
+if ! python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)'; then
+    echo "Error: Python 3.11+ is required. Found: ${python_version}" >&2
+    exit 1
+fi
+echo "✓ Python ${python_version}"
 
-echo "✓ Python version: $python_version"
+# --- Virtual environment --------------------------------------------------
+if [[ ! -d venv ]]; then
+    echo "Creating virtual environment..."
+    python3 -m venv venv
+fi
+./venv/bin/pip install --quiet --upgrade pip
+if [[ $DEV -eq 1 ]]; then
+    echo "Installing runtime + development dependencies..."
+    ./venv/bin/pip install --quiet -r requirements.txt -r requirements-dev.txt
+else
+    # Production deliberately gets ONLY requests + python-dotenv (~17 MB).
+    # Installing the dev tooling here costs about 90 MB for no runtime benefit.
+    echo "Installing runtime dependencies..."
+    ./venv/bin/pip install --quiet -r requirements.txt
+fi
+echo "✓ Dependencies installed"
 
-# Create virtual environment
-echo "Creating virtual environment..."
-python3 -m venv venv
-source venv/bin/activate
+mkdir -p logs data
+chmod 700 data
 
-# Install dependencies
-echo "Installing dependencies..."
-pip install --upgrade pip
-pip install -r requirements.txt
-
-# Create necessary directories
-echo "Creating directories..."
-mkdir -p logs
-
-# Set up configuration
-if [ ! -f .env ]; then
-    echo "Creating .env file from template..."
+# --- Configuration --------------------------------------------------------
+if [[ ! -f .env ]]; then
+    echo "Creating .env from template..."
     cp .env.example .env
-    chmod 600 .env
     echo ""
-    echo "⚠️  Please edit .env file with your configuration:"
-    echo "   - SMTP credentials"
-    echo "   - Alert email address"
-    echo "   - Website URLs"
+    echo "⚠️  Edit .env before running: SMTP credentials, ALERT_EMAIL, WEBSITES"
 else
-    echo "✓ .env file already exists"
+    echo "✓ .env already exists"
+fi
+# Unconditional, not only on creation: an existing .env may predate this rule.
+chmod 600 .env
+echo "✓ .env permissions set to 600"
+
+# --- Safety checks --------------------------------------------------------
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    if ! git check-ignore -q .env; then
+        echo "✗ DANGER: .env is NOT ignored by git. Fix .gitignore before committing." >&2
+        exit 1
+    fi
+    echo "✓ .env is git-ignored"
+    if [[ -f .githooks/pre-commit ]]; then
+        git config core.hooksPath .githooks
+        chmod +x .githooks/pre-commit
+        echo "✓ Secret-scanning pre-commit hook enabled"
+    fi
 fi
 
-# Create cron entry
+# --- Verify ---------------------------------------------------------------
 echo ""
-echo "To set up automatic monitoring, add this to your crontab:"
-echo "(Run 'crontab -e' to edit)"
-echo ""
-echo "# Website Monitor - runs every 5 minutes"
-echo "*/5 * * * * cd $(pwd) && $(pwd)/venv/bin/python monitor.py >> logs/cron.log 2>&1"
-echo ""
-
-# Test configuration
-echo "Testing configuration..."
-source venv/bin/activate
-python3 -c "from monitor import Config; Config()" 2>/dev/null
-if [ $? -eq 0 ]; then
+echo "Validating configuration..."
+# stderr is NOT discarded here; the previous version hid the actual reason.
+if ./venv/bin/python -c 'import monitor; monitor.Config()'; then
     echo "✓ Configuration valid"
+    ./venv/bin/python monitor.py --dry-run --quiet && echo "✓ Dry run succeeded"
 else
-    echo "✗ Configuration error - please check your .env file"
+    echo "✗ Configuration error (see the message above)" >&2
 fi
 
-echo ""
-echo "Installation complete!"
-echo ""
-echo "Next steps:"
-echo "1. Edit .env file with your configuration"
-echo "2. Test the monitor: ./venv/bin/python monitor.py"
-echo "3. Add cron job for automatic monitoring"
-echo ""
+# --- Scheduling -----------------------------------------------------------
+cat <<EOF
+
+Installation complete.
+
+Next steps:
+  1. Verify alerting:      ./venv/bin/python monitor.py --test-email
+  2. See current state:    ./venv/bin/python monitor.py --status
+  3. Schedule it (crontab -e):
+
+     # Website monitor - checks every 5 minutes (safe: runs are lock-guarded)
+     */5 * * * * cd ${HERE} && ${HERE}/venv/bin/python monitor.py >> ${HERE}/logs/cron.log 2>&1
+
+     # Daily uptime summary at 08:00
+     0 8 * * * cd ${HERE} && ${HERE}/venv/bin/python monitor.py --report daily >> ${HERE}/logs/cron.log 2>&1
+
+  A systemd timer is also provided (see systemd/ and the README).
+EOF

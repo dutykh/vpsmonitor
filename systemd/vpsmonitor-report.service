@@ -1,0 +1,10 @@
+[Unit]
+Description=Website Monitor - daily uptime summary
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/tools/vpsmonitor
+ExecStart=%h/tools/vpsmonitor/venv/bin/python %h/tools/vpsmonitor/monitor.py --report daily
+StandardOutput=journal
+StandardError=journal

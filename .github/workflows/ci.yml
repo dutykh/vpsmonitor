@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run tests
+        run: pytest tests/ -q
+
+      - name: Type check
+        run: mypy monitor.py --ignore-missing-imports
+        continue-on-error: true
+
+      - name: Lint
+        run: pylint monitor.py --disable=R0902,R0913,R0914,R0912,R0915,C0103,W0718
+        continue-on-error: true
+
+  secrets:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ensure no credentials are committed
+        run: |
+          set -e
+          if git ls-files | grep -qE '^\.env$|^\.env\.bak|^data/'; then
+            echo "::error::.env, a backup of it, or data/ is tracked by git"; exit 1
+          fi
+          if grep -rEn 'SMTP_PASSWORD=' --include='*.example' --include='*.md' . \
+             | grep -vE 'your-app-specific-password|<[^>]+>|example'; then
+            echo "::error::a non-placeholder SMTP_PASSWORD is present"; exit 1
+          fi
+          echo "No credentials found in tracked files."

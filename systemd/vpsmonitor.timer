@@ -1,0 +1,15 @@
+[Unit]
+Description=Run the website monitor every 5 minutes
+Documentation=https://github.com/dutykh/vpsmonitor
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+# Spreads load so every monitored host is not hit on the exact same second.
+RandomizedDelaySec=30
+# Catches up after downtime instead of silently skipping.
+Persistent=true
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

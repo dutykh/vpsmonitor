@@ -1,13 +1,9 @@
-# Website Monitor Dependencies
+# Website Monitor - runtime dependencies
 # Author: Dr. Denys Dutykh (Khalifa University of Science and Technology, Abu Dhabi, UAE)
+#
+# Production install:  pip install -r requirements.txt
+# Everything else the monitor needs is in the Python standard library
+# (sqlite3, ssl, tomllib, concurrent.futures, fcntl, smtplib, gzip).
 
-# Core dependencies
-requests>=2.31.0
-python-dotenv>=1.0.0
-
-# Development dependencies (optional)
-pytest>=7.4.0
-pytest-cov>=4.1.0
-black>=23.0.0
-pylint>=2.17.0
-mypy>=1.5.0
+requests>=2.31.0,<3.0.0
+python-dotenv>=1.0.0,<2.0.0

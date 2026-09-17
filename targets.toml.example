@@ -1,0 +1,58 @@
+# Optional richer target configuration for Website Monitor.
+# Author: Dr. Denys Dutykh (Khalifa University of Science and Technology, Abu Dhabi, UAE)
+#
+#   cp targets.toml.example targets.toml
+#
+# If targets.toml exists it REPLACES the WEBSITES / API_ENDPOINTS variables in
+# .env. Everything else (SMTP, thresholds, retention) still comes from .env.
+# Parsed with the standard library's tomllib - no extra dependency.
+
+# --- Websites --------------------------------------------------------------
+
+[[website]]
+name = "Main site"
+url  = "https://example.com"
+# Guard against the "HTTP 200 but the page is broken" case: a CMS database
+# error still returns 200, so status code alone will not catch it.
+expect = "Welcome to Example"
+
+[[website]]
+name = "Main site (www)"
+url  = "https://www.example.com"
+# Alerts for example.com and www.example.com are coalesced into one email.
+
+[[website]]
+name    = "Slow legacy app"
+url     = "https://legacy.example.com"
+timeout = 60                 # override the global TIMEOUT for this target only
+method  = "HEAD"             # cheaper when you only need reachability
+
+[[website]]
+name       = "Version endpoint"
+url        = "https://example.com/version"
+expect     = 'v\d+\.\d+\.\d+'
+expect_regex = true
+
+[[website]]
+name       = "Staging (self-signed cert)"
+url        = "https://staging.example.com"
+verify_ssl = false
+check_cert = false           # do not warn about expiry for this host
+
+# --- APIs ------------------------------------------------------------------
+
+[[api]]
+name            = "Scholar API"
+url             = "http://127.0.0.1:8000/api/v1/health"
+expected_status = 200
+
+[api.expected_response]      # every key must be present and equal
+status   = "healthy"
+database = "connected"
+cache    = "connected"
+
+[[api]]
+name            = "Partner API"
+url             = "https://api.partner.example.com/status"
+expected_status = 200
+headers         = { Authorization = "Bearer REPLACE_ME", Accept = "application/json" }
