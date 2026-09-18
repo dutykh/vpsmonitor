@@ -3,6 +3,52 @@
 All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.1.0] - 2026-09-18
+
+The security watchdog joins the repository, and the reason it was crying wolf is
+removed.
+
+### Added
+
+- **`security-watchdog.sh` is now part of this project.** It previously existed
+  as a single unversioned copy on the server it was guarding.
+- **A ninth check watches the shell startup files.** They run on every login and
+  are the cheapest place to plant something that survives a reboot, so they are
+  reported when they become writable by others and when their contents change.
+- **`--no-mail`, `--cpu-only` and `--verbose`**, so a new version can be tried on
+  a live machine without sending anything.
+- **Behaviour is configurable** through `WATCHDOG_CPU_THRESHOLD`,
+  `WATCHDOG_CPU_MIN_AGE`, `WATCHDOG_CPU_WINDOW`, `WATCHDOG_USER`,
+  `WATCHDOG_HOME`, `WATCHDOG_LOG` and `WATCHDOG_MONITOR_DIR`, instead of paths
+  written into the script.
+
+### Fixed
+
+- **The processor check reported processes that were using no processor at all.**
+  It read the per cent printed by `ps`, which is lifetime processor time divided
+  by lifetime, and for a process a few milliseconds old that is the quotient of
+  two quantised near-zero numbers: one clock tick inside four milliseconds reads
+  as five hundred per cent. Worse, the check was written as `ps ... | awk ...`,
+  and both members of a pipeline start together, so `ps` enumerated its own twin
+  on the other side of the pipe while excluding only `ps` by name. In production
+  this sent seven alerts in nine hours naming `awk` at between 160 and 500 per
+  cent on a machine whose busiest process was using four per cent of one core.
+  The check now restricts candidates to processes older than
+  `WATCHDOG_CPU_MIN_AGE`, reads `utime` and `stime` from `/proc` at the two ends
+  of a `WATCHDOG_CPU_WINDOW` interval, and compares the processor time genuinely
+  consumed during that interval. Its own process group is excluded by identifier
+  rather than by command name, so nothing escapes the check by choosing a name.
+- **The one-message-per-hour limit never held.** The fingerprint was taken over
+  the alert text, which contains the process identifier, so every recurrence
+  looked like a new kind of alarm. Findings now carry a stable key naming their
+  kind, and the fingerprint is taken over those.
+- **An alert said nothing useful.** `55593 500 awk` gave the reader no way to
+  judge it. A finding now carries the full command line, the owner, the parent,
+  the start time and the processor time accumulated.
+- **The shell-configuration check never matched.** Its pattern mixed basic and
+  extended regular expression syntax, so `base64 -d|bash` was read as a literal
+  string containing a pipe character rather than as an alternation.
+
 ## [2.0.0] - 2026-09-17
 
 A correctness and efficiency release following a full audit of the deployed

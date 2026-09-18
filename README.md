@@ -185,7 +185,7 @@ Guards against false alarms:
 - **Overlap** — a second run exits cleanly if one is already in progress.
 - **Monitoring gaps** — after a long silence, alerts carry a banner saying outage
   start times are lower bounds.
-- **Monitor-side failure** — if ≥80% of targets fail at once with DNS/connection
+- **Monitor-side failure** — if ⩾80% of targets fail at once with DNS/connection
   errors, the alert is re-titled to say the monitoring host is the likely cause.
 - **Cold start** — the first run after installation records pre-existing failures
   without paging you about all of them at once.
@@ -234,6 +234,89 @@ account without duplicating credentials:
 ./venv/bin/python monitor.py --notify "[SECURITY] watchdog alert on $(hostname)" \
                              --body-file /home/dds/logs/security-watchdog.log
 ```
+
+## The security watchdog
+
+`security-watchdog.sh` ships beside the monitor and uses exactly that channel.
+It looks for the signs of a crypto-miner or a backdoor and mails through the
+monitor's SMTP account, so that a compromise at three in the morning is not
+discovered at the next login. It runs from cron every five minutes:
+
+```cron
+*/5 * * * * /home/dds/tools/security-watchdog.sh
+```
+
+Nine checks run on each pass: processes consuming the processor, hidden
+executables in the home directory, random-named directories, executables dropped
+in the temporary directories, processes carrying a known miner or backdoor name,
+crontab entries that fetch or decode something, known malware signatures in the
+shell configuration, outbound connections to a mining pool, and the shell startup
+files, which are reported when they become writable by others or when their
+contents change.
+
+The processor check measures over a window rather than trusting the per cent that
+`ps` prints. That figure is lifetime processor time divided by lifetime, so for a
+process a few milliseconds old it is the quotient of two quantised near-zero
+numbers and takes arbitrary values; a single clock tick inside four milliseconds
+reads as five hundred per cent. Candidates are therefore restricted to processes
+that have already lived `WATCHDOG_CPU_MIN_AGE` seconds, their `utime` and `stime`
+are read from `/proc`, and the check waits `WATCHDOG_CPU_WINDOW` seconds and reads
+them again. What it compares against `WATCHDOG_CPU_THRESHOLD` is the processor
+time genuinely consumed during that window.
+
+| Variable | Meaning | Default |
+|----------|---------|---------|
+| `WATCHDOG_CPU_THRESHOLD` | Per cent of one core above which a process is reported | `150` |
+| `WATCHDOG_CPU_MIN_AGE` | Seconds a process must already have lived to be a candidate | `60` |
+| `WATCHDOG_CPU_WINDOW` | Seconds over which its processor use is measured | `15` |
+| `WATCHDOG_USER` | Account whose processes are watched | current user |
+| `WATCHDOG_HOME` | Home directory inspected | `$HOME` |
+| `WATCHDOG_LOG` | Log file | `$HOME/logs/security-watchdog.log` |
+| `WATCHDOG_MONITOR_DIR` | Where `monitor.py` and its virtualenv live | `$HOME/tools/vpsmonitor` |
+
+Three flags help when working on it: `--no-mail` runs every check and suppresses
+the email, `--cpu-only` runs the processor check alone and prints `clean` or the
+finding, and `--verbose` prints the findings to the terminal.
+
+A finding is mailed at most once an hour. The rate limiter fingerprints the
+*kind* of finding rather than its text, so a condition that persists across runs
+is recognised as one condition even though the process identifiers change.
+
+### Deploying the watchdog to a server
+
+The script is self-contained and has no dependencies beyond the monitor it mails
+through. Copy it, make it executable, and add the cron entry:
+
+```bash
+scp -P 2222 security-watchdog.sh dds@45.149.206.131:/home/dds/tools/security-watchdog.sh
+ssh -p 2222 dds@45.149.206.131 'chmod 755 /home/dds/tools/security-watchdog.sh'
+```
+
+Before trusting a new version, run it once with the email suppressed and confirm
+it reports what you expect, writing to a scratch log so the real one is untouched:
+
+```bash
+ssh -p 2222 dds@45.149.206.131 \
+  'WATCHDOG_LOG=/tmp/wd-test.log WATCHDOG_ALERT_FILE=/tmp/wd-test-ALERT \
+   /home/dds/tools/security-watchdog.sh --no-mail --verbose'
+```
+
+Then confirm the processor check is quiet on an idle machine and still sees a
+real offender. Start a busy loop somewhere that allows execution (`/tmp` is
+mounted `noexec` on this server, so the home directory is the place), wait past
+the minimum age, and run the check with the threshold lowered to match a
+single-core process:
+
+```bash
+mkdir -p ~/wdtest && cp "$(command -v bash)" ~/wdtest/zzdecoy
+setsid ~/wdtest/zzdecoy -c 'end=$((SECONDS+150)); while [ $SECONDS -lt $end ]; do :; done' &
+sleep 65
+WATCHDOG_CPU_THRESHOLD=80 /home/dds/tools/security-watchdog.sh --cpu-only
+pkill -x zzdecoy; rm -rf ~/wdtest
+```
+
+The cron entry needs no change when the script is replaced, and the first clean
+line appears in the log at the top of the next hour.
 
 ## Development
 
