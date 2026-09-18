@@ -4,7 +4,7 @@
 # server, and reports it by email through the alert channel of monitor.py.
 #
 # Runs from cron every five minutes:
-#   */5 * * * * /home/dds/tools/security-watchdog.sh
+#   */5 * * * * /home/dds/tools/vpsmonitor/security-watchdog.sh
 #
 # Author: Dr. Denys Dutykh (Khalifa University of Science and Technology,
 #         Abu Dhabi, UAE)

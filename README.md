@@ -240,10 +240,11 @@ account without duplicating credentials:
 `security-watchdog.sh` ships beside the monitor and uses exactly that channel.
 It looks for the signs of a crypto-miner or a backdoor and mails through the
 monitor's SMTP account, so that a compromise at three in the morning is not
-discovered at the next login. It runs from cron every five minutes:
+discovered at the next login. It runs from cron every five minutes, directly from this repository so there is
+no second copy to drift out of date:
 
 ```cron
-*/5 * * * * /home/dds/tools/security-watchdog.sh
+*/5 * * * * /home/dds/tools/vpsmonitor/security-watchdog.sh
 ```
 
 Nine checks run on each pass: processes consuming the processor, hidden
@@ -285,20 +286,23 @@ is recognised as one condition even though the process identifiers change.
 ### Deploying the watchdog to a server
 
 The script is self-contained and has no dependencies beyond the monitor it mails
-through. Copy it, make it executable, and add the cron entry:
+through. On the host that already carries this repository, point cron at the
+in-repo path and keep the working tree on `main`:
 
-```bash
-scp -P 2222 security-watchdog.sh dds@45.149.206.131:/home/dds/tools/security-watchdog.sh
-ssh -p 2222 dds@45.149.206.131 'chmod 755 /home/dds/tools/security-watchdog.sh'
+```cron
+*/5 * * * * /home/dds/tools/vpsmonitor/security-watchdog.sh
 ```
+
+A fresh clone on another host is the same idea: check the tree out under
+`$HOME/tools/vpsmonitor`, ensure `security-watchdog.sh` is executable, and add
+the cron line above (adjust the path if the clone lives elsewhere).
 
 Before trusting a new version, run it once with the email suppressed and confirm
 it reports what you expect, writing to a scratch log so the real one is untouched:
 
 ```bash
-ssh -p 2222 dds@45.149.206.131 \
-  'WATCHDOG_LOG=/tmp/wd-test.log WATCHDOG_ALERT_FILE=/tmp/wd-test-ALERT \
-   /home/dds/tools/security-watchdog.sh --no-mail --verbose'
+WATCHDOG_LOG=/tmp/wd-test.log WATCHDOG_ALERT_FILE=/tmp/wd-test-ALERT \
+  /home/dds/tools/vpsmonitor/security-watchdog.sh --no-mail --verbose
 ```
 
 Then confirm the processor check is quiet on an idle machine and still sees a
@@ -311,12 +315,13 @@ single-core process:
 mkdir -p ~/wdtest && cp "$(command -v bash)" ~/wdtest/zzdecoy
 setsid ~/wdtest/zzdecoy -c 'end=$((SECONDS+150)); while [ $SECONDS -lt $end ]; do :; done' &
 sleep 65
-WATCHDOG_CPU_THRESHOLD=80 /home/dds/tools/security-watchdog.sh --cpu-only
+WATCHDOG_CPU_THRESHOLD=80 /home/dds/tools/vpsmonitor/security-watchdog.sh --cpu-only
 pkill -x zzdecoy; rm -rf ~/wdtest
 ```
 
-The cron entry needs no change when the script is replaced, and the first clean
-line appears in the log at the top of the next hour.
+Deploying an update is `git pull` on `main`. There is no separate install copy,
+so the path in cron does not change. The first clean line appears in the log at
+the top of the next hour.
 
 ## Development
 

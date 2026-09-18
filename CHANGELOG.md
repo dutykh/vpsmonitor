@@ -11,7 +11,10 @@ removed.
 ### Added
 
 - **`security-watchdog.sh` is now part of this project.** It previously existed
-  as a single unversioned copy on the server it was guarding.
+  as a single unversioned copy on the server it was guarding. Cron runs the
+  in-repo path (`$HOME/tools/vpsmonitor/security-watchdog.sh`); there is no
+  second copy under `$HOME/tools/` to drift out of date. Deploying an update is
+  `git pull` on `main`.
 - **A ninth check watches the shell startup files.** They run on every login and
   are the cheapest place to plant something that survives a reboot, so they are
   reported when they become writable by others and when their contents change.
