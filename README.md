@@ -28,7 +28,7 @@ dependencies, no daemon required.
 
 - Linux (developed on Ubuntu 22.04)
 - **Python 3.11+** (`tomllib` is used for the optional TOML config)
-- An SMTP account for alerts
+- An SMTP account for alerts (your own mail server, or any provider)
 
 ## Quick start
 
@@ -78,13 +78,14 @@ to a `targets.toml` file for per-target options.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `SMTP_SERVER` | SMTP host | `smtp.gmail.com` |
+| `SMTP_SERVER` | SMTP host | *required* |
 | `SMTP_PORT` | SMTP port | `587` |
 | `SMTP_SECURITY` | `starttls`, `ssl` (port 465) or `plain` | `starttls` |
-| `SMTP_USERNAME` | Username / from-address | *required* |
-| `SMTP_PASSWORD` | Password or app-specific password | *required* |
+| `SMTP_USERNAME` | Login name, also the address the mail is sent from | *required* |
+| `SMTP_PASSWORD` | Password of that login | *required* |
 | `ALERT_EMAIL` | Recipient(s), comma-separated | *required* |
 | `SMTP_TIMEOUT` | Seconds before giving up on the SMTP server | `30` |
+| `FALLBACK_COMMAND` | Spare route, see below | empty |
 
 ### Targets
 
@@ -114,11 +115,43 @@ to a `targets.toml` file for per-target options.
 | `LOG_ARCHIVE_DAYS` | Days before gzipped logs are deleted | `365` |
 | `DB_RETENTION_DAYS` | Days of raw check rows before roll-up | `90` |
 
-### Gmail
+### Your own mail server
 
-1. Enable two-factor authentication.
-2. Create an app password at <https://myaccount.google.com/apppasswords>.
-3. Use your address as `SMTP_USERNAME` and the app password as `SMTP_PASSWORD`.
+The monitor needs only a login that is allowed to send; nobody has to read its
+mailbox. On a mail server of your own, create one account for it (for example
+`vpsmonitor@example.org`) and use the full address as the login:
+
+```text
+SMTP_SERVER=mail.example.org
+SMTP_PORT=587
+SMTP_SECURITY=starttls
+SMTP_USERNAME=vpsmonitor@example.org
+SMTP_PASSWORD=a-long-random-password
+ALERT_EMAIL=you@example.net
+```
+
+Messages are signed with `SMTP_USERNAME`, and their Message-ID carries its
+domain. A refused login is never repeated: a wrong password stays wrong, and many
+servers ban an address after a few refused logins. Delivery-failure notices from
+the recipient's host arrive in the mailbox of that account.
+
+### Spare route
+
+A mail server that is down cannot announce that it is down. `FALLBACK_COMMAND`
+names a command that carries the message instead when the mail cannot be sent. The
+command line is split like a shell would but run without a shell; the text
+`{subject}` in an argument is replaced by the subject, and the body arrives on the
+standard input. Alerts, recoveries, certificate warnings and `--notify` messages
+use it, and so does the message about a broken configuration. The test message and
+the daily summary never do, so that a broken mail setting shows as broken. With
+[tg-ping](https://github.com/dutykh/tg-ping) the spare route is a Telegram message:
+
+```text
+FALLBACK_COMMAND=/home/user/tools/tg-ping/bin/tg-ping --warn --title {subject}
+```
+
+A message delivered this way is recorded with the state `fallback` in the
+`notifications` table, and it is not sent again by mail.
 
 ## API monitoring
 
@@ -239,7 +272,8 @@ account without duplicating credentials:
 
 `security-watchdog.sh` ships beside the monitor and uses exactly that channel.
 It looks for the signs of a crypto-miner or a backdoor and mails through the
-monitor's SMTP account, so that a compromise at three in the morning is not
+monitor's SMTP account (and through its spare route when the mail cannot be sent),
+so that a compromise at three in the morning is not
 discovered at the next login. It runs from cron every five minutes, directly from this repository so there is
 no second copy to drift out of date:
 
@@ -342,7 +376,8 @@ Development tooling lives in `requirements-dev.txt` and a separate `.venv-dev`.
 1. `./venv/bin/python monitor.py --test-email`
 2. Check `logs/monitor_$(date +%Y%m%d).log`
 3. `./venv/bin/python monitor.py --status` — are the targets actually down?
-4. Gmail app passwords are revoked when the account password changes.
+4. A line `SMTP login refused` in the log means the password is wrong. Fix it
+   before the next run: the mail server may ban the address after repeated refusals.
 
 **Too many alerts** — raise `FAILURE_THRESHOLD` to require consecutive failed
 passes, or `ALERT_COOLDOWN` to stretch the escalation ladder.

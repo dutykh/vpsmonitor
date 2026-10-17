@@ -19,11 +19,13 @@ import logging
 import logging.handlers
 import os
 import re
+import shlex
 import shutil
 import smtplib
 import socket
 import sqlite3
 import ssl
+import subprocess
 import sys
 import threading
 import time
@@ -32,7 +34,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from email.utils import formatdate, make_msgid
+from email.utils import formatdate, make_msgid, parseaddr
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
@@ -47,7 +49,7 @@ try:  # Python 3.11+
 except ModuleNotFoundError:  # pragma: no cover
     tomllib = None  # type: ignore[assignment]
 
-__version__ = "2.0.0"
+__version__ = "2.2.0"
 
 # The project root is the directory holding this script, NOT the current working
 # directory. The previous version resolved logs/ and .env relative to CWD, which
@@ -338,7 +340,7 @@ class Config:
     """Runtime configuration, from environment/.env plus optional targets.toml."""
 
     def __init__(self, targets_file: Optional[Path] = None):
-        self.smtp_server = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+        self.smtp_server = (os.getenv("SMTP_SERVER") or "").strip()
         self.smtp_port = _env_int("SMTP_PORT", 587)
         self.smtp_security = (os.getenv("SMTP_SECURITY", "starttls") or "starttls").lower()
         self.smtp_username = os.getenv("SMTP_USERNAME")
@@ -347,6 +349,7 @@ class Config:
         self.alert_email = [
             addr.strip() for addr in (os.getenv("ALERT_EMAIL") or "").split(",") if addr.strip()
         ]
+        self.fallback_command = (os.getenv("FALLBACK_COMMAND") or "").strip()
 
         self.timeout = _env_int("TIMEOUT", 30)
         self.max_retries = max(1, _env_int("MAX_RETRIES", 3))
@@ -497,6 +500,8 @@ class Config:
     # -- validation --------------------------------------------------------
 
     def validate(self) -> None:
+        if not self.smtp_server:
+            raise ConfigError("SMTP server not configured (set SMTP_SERVER in .env)")
         if not self.smtp_username or not self.smtp_password:
             raise ConfigError(
                 "SMTP credentials not configured (set SMTP_USERNAME and SMTP_PASSWORD in .env)"
@@ -507,6 +512,11 @@ class Config:
             raise ConfigError(
                 f"SMTP_SECURITY must be starttls, ssl or plain (got {self.smtp_security!r})"
             )
+        if self.fallback_command:
+            try:
+                shlex.split(self.fallback_command)
+            except ValueError as exc:
+                raise ConfigError(f"FALLBACK_COMMAND cannot be parsed: {exc}") from exc
         if not self.targets:
             raise ConfigError(
                 f"No websites or APIs configured for monitoring (source: {self.targets_source})"
@@ -644,7 +654,7 @@ CREATE TABLE IF NOT EXISTS notifications (
     id         INTEGER PRIMARY KEY,
     kind       TEXT NOT NULL,
     dedup_key  TEXT NOT NULL UNIQUE,
-    state      TEXT NOT NULL DEFAULT 'pending',   -- pending | sent | failed
+    state      TEXT NOT NULL DEFAULT 'pending',   -- pending | sent | fallback | failed
     created_at TEXT NOT NULL,
     sent_at    TEXT,
     attempts   INTEGER NOT NULL DEFAULT 0,
@@ -1316,6 +1326,65 @@ class IncidentEngine:
 # Notification
 # ---------------------------------------------------------------------------
 
+def _smtp_connect(host: str, port: int, security: str,
+                  timeout: Optional[int]) -> smtplib.SMTP:
+    """Open an SMTP connection: implicit TLS ("ssl"), none ("plain"), else STARTTLS."""
+    if security == "ssl":
+        return smtplib.SMTP_SSL(host, port, timeout=timeout,
+                                context=ssl.create_default_context())
+    server = smtplib.SMTP(host, port, timeout=timeout)
+    if security != "plain":
+        server.starttls(context=ssl.create_default_context())
+    return server
+
+
+def _sender_domain(address: Optional[str]) -> str:
+    """Domain of a sender address, for a Message-ID that spam filters accept."""
+    _, bare = parseaddr(address or "")
+    if "@" in bare:
+        return bare.rsplit("@", 1)[1]
+    return socket.getfqdn()
+
+
+# Kinds of message the spare route may carry. A test message is left out on
+# purpose, so that a broken mail setting is reported as broken, and so is the
+# daily summary, which is not worth waking anyone for.
+FALLBACK_KINDS = ("DOWN", "RESOLVED", "SSL", "NOTIFY")
+FALLBACK_TIMEOUT_S = 30
+FALLBACK_MAX_BODY = 8000
+
+
+def run_fallback(command: str, subject: str, body: str) -> bool:
+    """Deliver a message by the spare route when the mail server cannot take it.
+
+    The command line is split like a shell would, but no shell is involved. The
+    text ``{subject}`` in an argument is replaced by the subject, and the body is
+    written to the standard input. Returns True if the command exits with status 0.
+    """
+    if not command:
+        return False
+    try:
+        argv = [part.replace("{subject}", subject) for part in shlex.split(command)]
+    except ValueError as exc:
+        logger.error("FALLBACK_COMMAND cannot be parsed: %s", exc)
+        return False
+    if not argv:
+        return False
+    try:
+        done = subprocess.run(argv, input=body[:FALLBACK_MAX_BODY], text=True,
+                              capture_output=True, timeout=FALLBACK_TIMEOUT_S,
+                              check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.error("Spare route failed to run: %s", exc)
+        return False
+    if done.returncode != 0:
+        logger.error("Spare route exited with status %d: %s", done.returncode,
+                     (done.stderr or "").strip()[-200:])
+        return False
+    logger.warning("Delivered by the spare route: %s", subject)
+    return True
+
+
 class EmailNotifier:
     """Builds and sends coalesced alert email."""
 
@@ -1327,19 +1396,13 @@ class EmailNotifier:
     # -- transport ---------------------------------------------------------
 
     def _connect(self) -> smtplib.SMTP:
-        timeout = self.config.smtp_timeout or None
-        if self.config.smtp_security == "ssl":
-            context = ssl.create_default_context()
-            return smtplib.SMTP_SSL(self.config.smtp_server, self.config.smtp_port,
-                                    timeout=timeout, context=context)
-        server = smtplib.SMTP(self.config.smtp_server, self.config.smtp_port, timeout=timeout)
-        if self.config.smtp_security == "starttls":
-            server.starttls(context=ssl.create_default_context())
-        return server
+        return _smtp_connect(self.config.smtp_server, self.config.smtp_port,
+                             self.config.smtp_security, self.config.smtp_timeout or None)
 
     def send(self, subject: str, body: str, html: Optional[str] = None,
              dedup_key: Optional[str] = None, kind: str = "ALERT") -> bool:
-        """Send one email. Returns True if it was accepted by the SMTP server."""
+        """Send one email. Returns True if the message was delivered, by the SMTP
+        server or, for the kinds in FALLBACK_KINDS, by the spare route."""
         if self.dry_run:
             logger.warning("[dry-run] would send: %s", subject)
             logger.debug("[dry-run] body:\n%s", body)
@@ -1348,7 +1411,7 @@ class EmailNotifier:
         if dedup_key and self.db is not None:
             existing = self.db.query_one(
                 "SELECT state FROM notifications WHERE dedup_key = ?", (dedup_key,))
-            if existing and existing["state"] == "sent":
+            if existing and existing["state"] in ("sent", "fallback"):
                 logger.debug("Notification %s already sent, skipping", dedup_key)
                 return False
             self.db.execute(
@@ -1364,7 +1427,7 @@ class EmailNotifier:
         msg["Date"] = formatdate(localtime=True)
         # A stable Message-ID lets the mail client thread/collapse a duplicate if
         # we crash between a successful send and recording that it was sent.
-        msg["Message-ID"] = make_msgid(domain="vpsmonitor.local")
+        msg["Message-ID"] = make_msgid(domain=_sender_domain(self.config.smtp_username))
         msg["Auto-Submitted"] = "auto-generated"
         msg.attach(MIMEText(body, "plain", "utf-8"))
         if html:
@@ -1384,18 +1447,29 @@ class EmailNotifier:
                     )
                 logger.info("Sent: %s", subject)
                 return True
+            except smtplib.SMTPAuthenticationError as exc:
+                # A wrong password stays wrong, and the mail server bans an
+                # address after a few refused logins: never try twice.
+                last_error = f"login refused: {exc}"
+                logger.error("SMTP login refused, not retrying: %s", exc)
+                break
             except (smtplib.SMTPException, OSError) as exc:
                 last_error = str(exc)
                 logger.warning("SMTP attempt %d failed: %s", attempt + 1, exc)
                 if attempt == 0:
                     time.sleep(5)
 
-        logger.error("Failed to send %r after 2 attempts: %s", subject, last_error)
+        logger.error("Failed to send %r: %s", subject, last_error)
+        delivered = (kind in FALLBACK_KINDS and
+                     run_fallback(self.config.fallback_command, subject, body))
         if dedup_key and self.db is not None:
             self.db.execute(
-                "UPDATE notifications SET state='failed', attempts=attempts+1, "
-                "last_error=? WHERE dedup_key = ?", (last_error, dedup_key))
-        return False
+                "UPDATE notifications SET state=?, sent_at=?, attempts=attempts+1, "
+                "last_error=? WHERE dedup_key = ?",
+                ("fallback" if delivered else "failed",
+                 now_utc().isoformat() if delivered else None,
+                 last_error, dedup_key))
+        return delivered
 
     # -- composition -------------------------------------------------------
 
@@ -2147,23 +2221,29 @@ def _emergency_notify(subject: str, body: str) -> None:
     A broken .env used to produce a silent traceback in cron.log and nothing else.
     """
     try:
-        server_host = os.getenv("SMTP_SERVER", "smtp.gmail.com")
-        port = int(os.getenv("SMTP_PORT", "587") or 587)
+        server_host = (os.getenv("SMTP_SERVER") or "").strip()
         username = os.getenv("SMTP_USERNAME")
         password = os.getenv("SMTP_PASSWORD")
         recipients = [a.strip() for a in (os.getenv("ALERT_EMAIL") or "").split(",") if a.strip()]
-        if not (username and password and recipients):
-            return
-        msg = MIMEText(body, "plain", "utf-8")
-        msg["From"] = username
-        msg["To"] = ", ".join(recipients)
-        msg["Subject"] = subject
-        msg["Date"] = formatdate(localtime=True)
-        with closing(smtplib.SMTP(server_host, port, timeout=30)) as server:
-            server.starttls(context=ssl.create_default_context())
-            server.login(username, password)
-            server.send_message(msg)
-        logger.info("Sent configuration-failure notification")
+        if server_host and username and password and recipients:
+            try:
+                msg = MIMEText(body, "plain", "utf-8")
+                msg["From"] = username
+                msg["To"] = ", ".join(recipients)
+                msg["Subject"] = subject
+                msg["Date"] = formatdate(localtime=True)
+                msg["Message-ID"] = make_msgid(domain=_sender_domain(username))
+                msg["Auto-Submitted"] = "auto-generated"
+                security = (os.getenv("SMTP_SECURITY", "starttls") or "starttls").lower()
+                with closing(_smtp_connect(server_host, _env_int("SMTP_PORT", 587),
+                                           security, 30)) as server:
+                    server.login(username, password)
+                    server.send_message(msg)
+                logger.info("Sent configuration-failure notification")
+                return
+            except (smtplib.SMTPException, OSError) as exc:
+                logger.error("Could not mail the configuration-failure notification: %s", exc)
+        run_fallback((os.getenv("FALLBACK_COMMAND") or "").strip(), subject, body)
     except Exception as exc:  # noqa: BLE001 - this path must never raise
         logger.error("Could not send configuration-failure notification: %s", exc)
 
@@ -2222,6 +2302,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             f"{socket.gethostname()}.\n\n"
             f"Sent: {now_utc().strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
             f"SMTP: {config.smtp_server}:{config.smtp_port} ({config.smtp_security})\n"
+            f"Sender: {config.smtp_username}\n"
+            f"Spare route: {'configured' if config.fallback_command else 'none'}\n"
             f"Targets configured: {len(config.targets)} "
             f"({len(config.websites)} websites, {len(config.api_endpoints)} APIs)\n"
             f"Config source: {config.targets_source}\n\n"

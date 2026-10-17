@@ -43,6 +43,22 @@ def test_missing_credentials_raise(monkeypatch):
         monitor.Config()
 
 
+def test_missing_smtp_server_raises(monkeypatch):
+    """There is no built-in mail provider any more: the server must be named."""
+    monkeypatch.delenv("SMTP_SERVER")
+    with pytest.raises(monitor.ConfigError, match="SMTP server"):
+        monitor.Config()
+
+
+def test_spare_route_is_read_and_checked(monkeypatch):
+    assert monitor.Config().fallback_command == ""
+    monkeypatch.setenv("FALLBACK_COMMAND", "/usr/bin/tg-ping --warn --title {subject}")
+    assert monitor.Config().fallback_command.startswith("/usr/bin/tg-ping")
+    monkeypatch.setenv("FALLBACK_COMMAND", "tg-ping --title 'unclosed")
+    with pytest.raises(monitor.ConfigError, match="FALLBACK_COMMAND"):
+        monitor.Config()
+
+
 def test_no_targets_raises(monkeypatch):
     monkeypatch.setenv("WEBSITES", "")
     with pytest.raises(monitor.ConfigError, match="No websites or APIs"):

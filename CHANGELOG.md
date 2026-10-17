@@ -3,6 +3,41 @@
 All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.2.0] - 2026-10-17
+
+Alerts leave through a mail server of one's own, and a message no longer vanishes
+when that server is down.
+
+### Added
+
+- **A spare route, `FALLBACK_COMMAND`.** When the mail cannot be sent, the named
+  command carries the message instead: no shell is involved, `{subject}` stands
+  for the subject, the body arrives on the standard input. Alerts, recoveries,
+  certificate warnings, `--notify` messages and the message about a broken
+  configuration use it; the test message and the daily summary do not, so that a
+  broken mail setting is still reported as broken. A message delivered this way
+  is recorded with the state `fallback` and is not mailed again.
+- **The test message names the sender and says whether a spare route is set.**
+
+### Changed
+
+- **There is no built-in mail provider.** `SMTP_SERVER` is required, and the
+  default `smtp.gmail.com` is gone from the configuration and from the message
+  about a broken configuration. The README describes an account on a mail server
+  of one's own instead of Gmail.
+- **The Message-ID carries the domain of the sender** instead of the invented
+  `vpsmonitor.local`, which spam filters score down.
+
+### Fixed
+
+- **A refused login was tried twice per message.** Many servers ban an address
+  after a few refused logins, so a wrong password could lock out every other
+  service behind the same address. A refused login is now reported once and not
+  repeated.
+- **The message about a broken configuration ignored `SMTP_SECURITY`** and always
+  used STARTTLS, so it failed on an implicit-TLS port. It now shares the
+  connection code of the ordinary messages.
+
 ## [2.1.0] - 2026-09-18
 
 The security watchdog joins the repository, and the reason it was crying wolf is

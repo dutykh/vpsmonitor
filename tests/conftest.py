@@ -14,8 +14,10 @@ def _clean_env(monkeypatch, tmp_path):
     for key in list(os.environ):
         if key.startswith(("SMTP_", "ALERT_", "WEBSITES", "API_ENDPOINTS", "CHECK_",
                            "TIMEOUT", "MAX_", "LOG_", "SSL_", "HEARTBEAT", "GROUP_",
-                           "FAILURE_", "DB_", "TARGETS_", "SLOW_", "USER_AGENT")):
+                           "FAILURE_", "DB_", "TARGETS_", "SLOW_", "USER_AGENT",
+                           "FALLBACK_")):
             monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("SMTP_SERVER", "mail.example.com")
     monkeypatch.setenv("SMTP_USERNAME", "monitor@example.com")
     monkeypatch.setenv("SMTP_PASSWORD", "app-password")
     monkeypatch.setenv("ALERT_EMAIL", "alerts@example.com")
