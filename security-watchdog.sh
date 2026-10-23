@@ -17,6 +17,7 @@ LOG="${WATCHDOG_LOG:-$WATCH_HOME/logs/security-watchdog.log}"
 ALERT_FILE="${WATCHDOG_ALERT_FILE:-$WATCH_HOME/logs/SECURITY_ALERT}"
 STATE_DIR="$(dirname "$ALERT_FILE")"
 MONITOR_DIR="${WATCHDOG_MONITOR_DIR:-$WATCH_HOME/tools/vpsmonitor}"
+read -ra TMP_DIRS <<< "${WATCHDOG_TMP_DIRS:-/tmp /var/tmp}"
 
 # Processor thresholds. A process is reported when the processor time it
 # actually consumes during a window of CPU_WINDOW seconds exceeds CPU_THRESHOLD
@@ -141,8 +142,31 @@ if [ -n "$RANDOM_DIRS" ]; then
     log_alert "Suspicious random-named directories: $RANDOM_DIRS" "random-dir:$RANDOM_DIRS"
 fi
 
-# 4. Executables dropped in the temporary directories.
-TMP_EXECS=$(find /tmp /var/tmp -user "$WATCH_USER" -type f -executable 2>/dev/null | grep -v node-compile-cache | head -5)
+# A program: an ELF binary, or a script opening with "#!". A file that cannot be
+# read cannot be cleared either, so it counts as one.
+is_program() {
+    local magic
+    [ -r "$1" ] || return 0
+    magic=$(head -c 4 -- "$1" 2>/dev/null | od -An -tx1 | tr -d ' \n')
+    [ "$magic" = 7f454c46 ] || [ "${magic:0:4}" = 2321 ]
+}
+
+# 4. Executables dropped in the temporary directories. The execute bit is read
+# from the permissions: find -executable asks the kernel whether the file may
+# run, which a noexec mount always refuses, so that nothing there would be seen.
+# Chromium unpacks the components it downloads (model manifests, a speech
+# engine) into folders of its own, org.chromium.Chromium.scoped_dir.XXXXXX, and
+# leaves the execute bit on their data files; Node's compile cache is treated
+# alike. Inside those folders only a program is reported, so that their names,
+# which anyone can read here, cannot shelter one.
+TMP_EXECS=$(find "${TMP_DIRS[@]}" -user "$WATCH_USER" -type f -perm -u+x 2>/dev/null |
+    while IFS= read -r f; do
+        case "$f" in
+            */org.chromium.Chromium.scoped_dir.*/*|*/node-compile-cache/*)
+                is_program "$f" || continue ;;
+        esac
+        printf '%s\n' "$f"
+    done | head -5)
 if [ -n "$TMP_EXECS" ]; then
     log_alert "Executable files in tmp: $TMP_EXECS" "tmp-exec:$TMP_EXECS"
 fi

@@ -299,6 +299,15 @@ are read from `/proc`, and the check waits `WATCHDOG_CPU_WINDOW` seconds and rea
 them again. What it compares against `WATCHDOG_CPU_THRESHOLD` is the processor
 time genuinely consumed during that window.
 
+The check of the temporary directories reads the execute bit from the
+permissions, so that it also sees the files of a `noexec` mount, where
+`find -executable` sees none. Chromium unpacks the components it downloads into
+folders named `org.chromium.Chromium.scoped_dir.XXXXXX` and leaves the execute bit
+on their data files, and Node's compile cache, `node-compile-cache`, is treated
+alike: inside those folders only a program is reported, that is an ELF binary, a
+script opening with `#!`, or a file the watchdog cannot read. A rule on the name
+alone would tell anyone reading this script where to hide a miner.
+
 | Variable | Meaning | Default |
 |----------|---------|---------|
 | `WATCHDOG_CPU_THRESHOLD` | Per cent of one core above which a process is reported | `150` |
@@ -306,6 +315,7 @@ time genuinely consumed during that window.
 | `WATCHDOG_CPU_WINDOW` | Seconds over which its processor use is measured | `15` |
 | `WATCHDOG_USER` | Account whose processes are watched | current user |
 | `WATCHDOG_HOME` | Home directory inspected | `$HOME` |
+| `WATCHDOG_TMP_DIRS` | Temporary directories searched for executables, separated by spaces | `/tmp /var/tmp` |
 | `WATCHDOG_LOG` | Log file | `$HOME/logs/security-watchdog.log` |
 | `WATCHDOG_MONITOR_DIR` | Where `monitor.py` and its virtualenv live | `$HOME/tools/vpsmonitor` |
 
@@ -339,11 +349,14 @@ WATCHDOG_LOG=/tmp/wd-test.log WATCHDOG_ALERT_FILE=/tmp/wd-test-ALERT \
   /home/dds/tools/vpsmonitor/security-watchdog.sh --no-mail --verbose
 ```
 
+The tests in `tests/test_watchdog.py` try the check of the temporary directories
+the same way, on a folder of their own given by `WATCHDOG_TMP_DIRS`.
+
 Then confirm the processor check is quiet on an idle machine and still sees a
-real offender. Start a busy loop somewhere that allows execution (`/tmp` is
-mounted `noexec` on this server, so the home directory is the place), wait past
-the minimum age, and run the check with the threshold lowered to match a
-single-core process:
+real offender. Start a busy loop from the home directory (a copy of the shell
+placed in `/tmp` would itself be reported by the watchdog's own five-minute run),
+wait past the minimum age, and run the check with the threshold lowered to match
+a single-core process:
 
 ```bash
 mkdir -p ~/wdtest && cp "$(command -v bash)" ~/wdtest/zzdecoy

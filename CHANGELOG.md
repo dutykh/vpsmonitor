@@ -3,6 +3,36 @@
 All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.2.1] - 2026-10-23
+
+The watchdog stops taking Chromium's data files for programs, without giving a
+program a place to hide.
+
+### Fixed
+
+- **Chromium's temporary folders raised an alarm on every run of the browser.**
+  Chromium unpacks the components it downloads (model manifests, a speech engine)
+  into `/tmp/org.chromium.Chromium.scoped_dir.XXXXXX` and leaves the execute bit
+  on their data files, which the check of the temporary directories reported as
+  executables. Inside those folders, and inside Node's `node-compile-cache`, which
+  was passed over by name until now, only a program is reported: an ELF binary, a
+  script opening with `#!`, or a file the watchdog cannot read. A rule on the
+  folder name alone would tell anyone reading this script where to hide a miner.
+- **The check of the temporary directories saw nothing on a `noexec` mount.** It
+  used `find -executable`, which asks the kernel whether a file may run, and the
+  kernel refuses for every file of a `noexec` mount; on a host whose `/tmp` is
+  mounted that way the check had never seen anything there. The execute bit is
+  now read from the permissions.
+
+### Added
+
+- **A new variable, `WATCHDOG_TMP_DIRS`,** names the temporary directories
+  searched (`/tmp /var/tmp` by default), so that the check can be tried on a
+  folder of one's own.
+- **The first tests of the watchdog**, in `tests/test_watchdog.py`: data files in
+  the folders of Chromium and Node are passed over, programs there are reported,
+  and every executable file elsewhere is reported as before.
+
 ## [2.2.0] - 2026-10-17
 
 Alerts leave through a mail server of one's own, and a message no longer vanishes
