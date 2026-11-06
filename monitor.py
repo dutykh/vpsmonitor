@@ -49,7 +49,7 @@ try:  # Python 3.11+
 except ModuleNotFoundError:  # pragma: no cover
     tomllib = None  # type: ignore[assignment]
 
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 
 # The project root is the directory holding this script, NOT the current working
 # directory. The previous version resolved logs/ and .env relative to CWD, which

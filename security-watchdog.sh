@@ -19,16 +19,25 @@ STATE_DIR="$(dirname "$ALERT_FILE")"
 MONITOR_DIR="${WATCHDOG_MONITOR_DIR:-$WATCH_HOME/tools/vpsmonitor}"
 read -ra TMP_DIRS <<< "${WATCHDOG_TMP_DIRS:-/tmp /var/tmp}"
 
-# Processor thresholds. A process is reported when the processor time it
-# actually consumes during a window of CPU_WINDOW seconds exceeds CPU_THRESHOLD
-# per cent of one core, and when it was already at least CPU_MIN_AGE seconds old
-# when the window opened. The age condition matters: the per cent that ps prints
-# is lifetime processor time divided by lifetime, which for a process a few
+# Processor thresholds. A process is busy when the processor time it actually
+# consumes during a window of CPU_WINDOW seconds exceeds CPU_THRESHOLD per cent
+# of one core, and when it was already at least CPU_MIN_AGE seconds old when the
+# window opened. The age condition matters: the per cent that ps prints is
+# lifetime processor time divided by lifetime, which for a process a few
 # milliseconds old is the quotient of two quantised near-zero numbers and takes
 # arbitrary values. Measuring over a window removes that artefact entirely.
+#
+# One busy window proves little: the rebuild of a website, a language server
+# that starts, a task of an agent each keep several cores busy for a few
+# minutes. A process is therefore reported only once it has been busy at every
+# pass for CPU_PERSIST seconds, and only if its average over that time exceeds
+# the threshold too, which a process busy at the moments of measurement alone
+# would not achieve.
 CPU_THRESHOLD="${WATCHDOG_CPU_THRESHOLD:-150}"
 CPU_MIN_AGE="${WATCHDOG_CPU_MIN_AGE:-60}"
 CPU_WINDOW="${WATCHDOG_CPU_WINDOW:-15}"
+CPU_PERSIST="${WATCHDOG_CPU_PERSIST:-900}"
+CPU_STATE="$STATE_DIR/.watchdog-cpu"
 
 NO_MAIL=0
 CPU_ONLY=0
@@ -62,52 +71,123 @@ log_alert() {
     ALERT=1
 }
 
-# Processor time consumed so far by a process, in clock ticks. Fields 14 and 15
-# of /proc/PID/stat are utime and stime; the command name held in field 2 may
-# contain spaces and parentheses, so everything up to the final ") " is dropped
-# and the remainder counted from field 3.
-cpu_ticks() {
+# Processor time consumed so far by a process, in clock ticks, and the moment
+# it started, in clock ticks after boot: "<ticks> <start>". Fields 14 and 15 of
+# /proc/PID/stat are utime and stime, field 22 is starttime; the command name
+# held in field 2 may contain spaces and parentheses, so everything up to the
+# final ") " is dropped and the remainder counted from field 3.
+cpu_stat() {
     local stat rest
     [ -r "/proc/$1/stat" ] || return 1
     stat=$(< "/proc/$1/stat") || return 1
     rest=${stat##*') '}
-    printf '%s' "$rest" | awk '{print $12 + $13}'
+    printf '%s' "$rest" | awk '{print $12 + $13, $20}'
 }
 
-# 1. Processes burning the processor, measured honestly over a window.
+# "40 s", "17 min".
+duration_phrase() {
+    if [ "$1" -lt 120 ]; then printf '%s s' "$1"; else printf '%s min' $(( ($1 + 30) / 60 )); fi
+}
+
+# A busy process whose streak is still too short to report: one line in the log,
+# and on the terminal with --verbose, but no alert and therefore no mail.
+log_watch() {
+    local line
+    line="CPU watch: $(ps -o comm= -p "$1" 2>/dev/null) (pid $1) at $2% of one core over ${CPU_WINDOW}s, above ${CPU_THRESHOLD}% for $3 s of the ${CPU_PERSIST} s that raise an alert"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $line" >> "$LOG"
+    [ "$VERBOSE" -eq 1 ] && echo "$line"
+    return 0
+}
+
+# 1. Processes burning the processor, measured honestly over a window, and
+# reported only when the load lasts.
+#
+# The streaks are kept in CPU_STATE: a first line "boot <boot id>", then one
+# line "<pid> <start> <since> <since_ticks>" for each process found busy at the
+# previous pass, where since is the epoch at which its streak began and
+# since_ticks its processor time at that moment. The pid and the start time
+# together name one process even when its number is reused, and the boot id
+# voids every streak after a reboot. A pass that finds the process below the
+# threshold drops its line, so that the count starts over.
 check_high_cpu() {
-    local clk_tck own_pgid pid before_t after_t delta rate
-    local -A before
+    local clk_tck own_pgid boot pid start_t since since_t before_t after_t after_s
+    local delta rate win_start now held avg key tmp
+    local -A before start prev
+    local -a streaks=()
     clk_tck=$(getconf CLK_TCK 2>/dev/null) || clk_tck=100
     own_pgid=$(ps -o pgid= -p $$ 2>/dev/null | tr -d ' ')
+    boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null)
+
+    if [ -r "$CPU_STATE" ] && [ "$(head -n 1 "$CPU_STATE")" = "boot $boot" ]; then
+        while read -r pid start_t since since_t; do
+            [ -n "$since_t" ] && prev["$pid $start_t"]="$since $since_t"
+        done < <(tail -n +2 "$CPU_STATE")
+    fi
 
     # Candidates: old enough to be real, and outside this script's own process
     # group, so that nothing can escape the check by choosing a command name.
     while read -r pid; do
         [ -n "$pid" ] || continue
-        before_t=$(cpu_ticks "$pid") || continue
+        read -r before_t start_t < <(cpu_stat "$pid") || continue
+        [ -n "$start_t" ] || continue
         before["$pid"]=$before_t
+        start["$pid"]=$start_t
     done < <(ps -u "$WATCH_USER" -o pid=,pgid=,etimes= 2>/dev/null |
              awk -v age="$CPU_MIN_AGE" -v pg="$own_pgid" -v self="$$" \
                  '$3 >= age && $2 != pg && $1 != self {print $1}')
 
-    [ ${#before[@]} -eq 0 ] && return 0
-    sleep "$CPU_WINDOW"
+    if [ ${#before[@]} -gt 0 ]; then
+        win_start=$(date +%s)
+        sleep "$CPU_WINDOW"
+        now=$(date +%s)
 
-    for pid in "${!before[@]}"; do
-        after_t=$(cpu_ticks "$pid") || continue        # died during the window
-        delta=$(( after_t - before[$pid] ))
-        [ "$delta" -gt 0 ] || continue
-        rate=$(awk -v d="$delta" -v t="$clk_tck" -v w="$CPU_WINDOW" \
-                   'BEGIN { printf "%.0f", (d * 100) / (t * w) }')
-        [ "$rate" -gt "$CPU_THRESHOLD" ] || continue
-        log_alert "$(describe_process "$pid" "$rate")" "high-cpu:$(ps -o comm= -p "$pid" 2>/dev/null)"
-    done
+        for pid in "${!before[@]}"; do
+            read -r after_t after_s < <(cpu_stat "$pid") || continue   # died during the window
+            [ "$after_s" = "${start[$pid]}" ] || continue               # its number was reused
+            delta=$(( after_t - before[$pid] ))
+            [ "$delta" -gt 0 ] || continue
+            rate=$(awk -v d="$delta" -v t="$clk_tck" -v w="$CPU_WINDOW" \
+                       'BEGIN { printf "%.0f", (d * 100) / (t * w) }')
+            [ "$rate" -gt "$CPU_THRESHOLD" ] || continue
+
+            key="$pid ${start[$pid]}"
+            if [ -n "${prev[$key]:-}" ]; then
+                read -r since since_t <<< "${prev[$key]}"
+            else
+                since=$win_start
+                since_t=${before[$pid]}
+            fi
+            streaks+=("$key $since $since_t")
+            held=$(( now - since ))
+            [ "$held" -gt 0 ] || held=1
+            avg=$(awk -v d="$(( after_t - since_t ))" -v t="$clk_tck" -v s="$held" \
+                      'BEGIN { printf "%.0f", (d * 100) / (t * s) }')
+            if [ "$held" -ge "$CPU_PERSIST" ] && [ "$avg" -gt "$CPU_THRESHOLD" ]; then
+                log_alert "$(describe_process "$pid" "$rate" "$avg" "$held")" \
+                          "high-cpu:$(ps -o comm= -p "$pid" 2>/dev/null)"
+            else
+                log_watch "$pid" "$rate" "$held"
+            fi
+        done
+    fi
+
+    # --cpu-only only looks: the streaks are those of the passes made by cron,
+    # and a test with other thresholds must not disturb them.
+    [ "$CPU_ONLY" -eq 1 ] && return 0
+    tmp=$(mktemp "$CPU_STATE.XXXXXX" 2>/dev/null) || return 0
+    if {
+        printf 'boot %s\n' "$boot"
+        for key in "${streaks[@]}"; do printf '%s\n' "$key"; done
+    } > "$tmp" && mv -f "$tmp" "$CPU_STATE"; then
+        return 0
+    fi
+    rm -f "$tmp"
+    return 0
 }
 
 # A description a reader can judge without opening a session on the server.
 describe_process() {
-    local pid=$1 rate=$2 comm user ppid pcomm started cputime cmd
+    local pid=$1 rate=$2 avg=$3 held=$4 comm user ppid pcomm started cputime cmd
     comm=$(ps -o comm= -p "$pid" 2>/dev/null)
     user=$(ps -o user= -p "$pid" 2>/dev/null | tr -d ' ')
     ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
@@ -116,8 +196,8 @@ describe_process() {
     cputime=$(ps -o time= -p "$pid" 2>/dev/null | tr -d ' ')
     cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | cut -c1-300)
     [ -n "$cmd" ] || cmd="[$comm]"
-    printf 'High CPU: %s uses %s%% of one core, sustained over %ss\n' \
-           "$comm" "$rate" "$CPU_WINDOW"
+    printf 'High CPU: %s has stayed above %s%% of one core for %s, %s%% on average, %s%% over the last %ss\n' \
+           "$comm" "$CPU_THRESHOLD" "$(duration_phrase "$held")" "$avg" "$rate" "$CPU_WINDOW"
     printf '      process %s, owner %s, started %s, CPU time so far %s\n' \
            "$pid" "$user" "$started" "$cputime"
     printf '      parent %s (%s)\n      command: %s' "$ppid" "$pcomm" "$cmd"
@@ -230,7 +310,10 @@ fi
 if [ "$ALERT" -eq 1 ]; then
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] === ALERTS FOUND ===" >> "$LOG"
 
-    printf "!!! SECURITY ALERT - $(date '+%Y-%m-%d %H:%M:%S') !!!\n\nThe following issues were detected:\n${ALERTS}\n\nCheck full log: %s\n" "$LOG" > "$ALERT_FILE"
+    # The findings go in as an argument, never into the format: a "%" in them,
+    # as in "150% of one core", would be read as a conversion and garble the file.
+    printf '!!! SECURITY ALERT - %s !!!\n\nThe following issues were detected:\n%b\n\nCheck full log: %s\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "$ALERTS" "$LOG" > "$ALERT_FILE"
 
     # Email through the SMTP account of vpsmonitor, so that a compromise at 03:00
     # is not discovered only at the next login. Rate-limited to one message per

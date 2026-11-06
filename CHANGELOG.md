@@ -3,6 +3,48 @@
 All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.3.0] - 2026-11-06
+
+The watchdog reports a busy processor only when the load lasts.
+
+### Changed
+
+- **The processor check waits for the load to last.** Since mid-October it had
+  raised five alerts, each for legitimate work seen at a single pass: two
+  rebuilds of a website (195% and 266% of one core), a task of the Hermes agent
+  (396%), a language server that the agent had started (184%) and the server
+  program of the Warp terminal (197%). Five minutes later each was below the
+  threshold again. A process is now reported only when it has been above
+  `WATCHDOG_CPU_THRESHOLD` at every pass for `WATCHDOG_CPU_PERSIST` seconds,
+  15 minutes by default, and on average over that time as well. Until then each
+  pass writes one line `CPU watch:` in the log, and no mail goes out. The streaks
+  are kept in `.watchdog-cpu` beside the alert file, for the current boot only,
+  each process known by its number together with its start time; one pass below
+  the threshold starts the count over. The alert now says how long the process
+  has been busy, its average over that time and its share over the last window.
+  `--cpu-only` reads the streaks and never writes them.
+- **`monitor.py --version` reports 2.3.0**; it had stayed at 2.2.0 through 2.2.1.
+
+### Fixed
+
+- **The alert file garbled every processor alert.** The watchdog wrote
+  `SECURITY_ALERT` with the findings pasted into the format of `printf`, so that
+  the `%` of "266% of one core" was read as a conversion: the text came out
+  mangled, and `printf` complained of an invalid number. The findings are now
+  passed as an argument. The mail was never affected, since its text was
+  already built that way.
+
+### Added
+
+- **A new variable, `WATCHDOG_CPU_PERSIST`,** the number of seconds a process
+  must stay busy before it is reported. `0` brings back the report on a single
+  window, which the test procedure of the README uses.
+- **Four tests of the processor check**, on a busy program of their own: busy
+  once, it is only watched; busy at two passes three seconds apart, it is
+  reported, and the alert file keeps the text of the finding intact; stopped
+  during one pass, it starts its count over; with `WATCHDOG_CPU_PERSIST=0` it is
+  reported at once.
+
 ## [2.2.1] - 2026-10-23
 
 The watchdog stops taking Chromium's data files for programs, without giving a
@@ -122,7 +164,7 @@ removed.
 A correctness and efficiency release following a full audit of the deployed
 system. The crontab entry from 1.x keeps working unchanged.
 
-### Fixed — alerting correctness
+### Fixed: alerting correctness
 
 - **A repeat outage inside the cooldown window was silently swallowed.** Alert
   state was written when an alert fired but never cleared when a site recovered,
@@ -133,8 +175,8 @@ system. The crontab entry from 1.x keeps working unchanged.
   outage duration.
 - **`ALERT_COOLDOWN` equal to the check interval caused alerts to alternate.**
   Run-to-run drift meant elapsed time measured ~3597s against a 3600s threshold,
-  so alerts fired only on alternate hours — visible in production during a
-  30-hour outage. Re-alerts now follow an escalating ladder anchored to the
+  so alerts fired only on alternate hours (visible in production during a
+  30-hour outage). Re-alerts now follow an escalating ladder anchored to the
   incident's confirmation time, compared with a 300-second grace window.
 - **Targets checked in the same pass could straddle a threshold.** Each alert
   stamped its own `datetime.now()`, so apex and `www` twins drifted apart by
@@ -165,7 +207,7 @@ system. The crontab entry from 1.x keeps working unchanged.
 - SQLite store (`data/monitor.db`) for checks, incidents, certificates and runs
 - TLS certificate expiry monitoring with staged warnings
 - Daily / weekly / monthly uptime reports (`--report`), plain text and HTML
-- Content validation — an `expect` string or regex per target
+- Content validation: an `expect` string or regex per target
 - Optional `targets.toml` configuration via stdlib `tomllib`
 - Concurrent checks via `ThreadPoolExecutor` (`MAX_WORKERS`)
 - Alert coalescing by registrable domain (`GROUP_ALERTS`)
@@ -186,7 +228,7 @@ system. The crontab entry from 1.x keeps working unchanged.
 - **Python 3.11+** is now required (`tomllib`)
 - Paths resolve relative to the script, not the working directory
 - Console output is TTY-aware: colours only on a terminal, and only warnings and
-  above under cron — a healthy run no longer writes anything to `cron.log`
+  above under cron; a healthy run no longer writes anything to `cron.log`
 - `requirements.txt` split; the production virtualenv drops from 106 MB to ~17 MB
 - Response times distinguish time-to-first-byte from total
 - Alert emails redact secret-looking fields and truncate long bodies

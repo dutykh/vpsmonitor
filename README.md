@@ -12,15 +12,15 @@ dependencies, no daemon required.
 ## Features
 
 - **Website and JSON API monitoring** with status, content and response-validation checks
-- **Incident tracking** — an outage is a first-class object with a start, an end and a duration
-- **Recovery alerts** — you are told when a site comes back, and how long it was out
+- **Incident tracking**: an outage is a first-class object with a start, an end and a duration
+- **Recovery alerts**: you are told when a site comes back, and how long it was out
 - **Escalating re-alerts** (1h, 2h, 4h, 8h, 12h, then daily) instead of a flat cooldown
-- **Grouped alerts** — `example.com` and `www.example.com` arrive as one email, not two
+- **Grouped alerts**: `example.com` and `www.example.com` arrive as one email, not two
 - **TLS expiry warnings** at 21/14/7/3/1 days, independent of whatever issues your certificates
-- **Uptime history in SQLite** — real uptime percentages, p95 latency and incident history
+- **Uptime history in SQLite**: real uptime percentages, p95 latency and incident history
 - **Daily/weekly summary emails** built from that history
 - **Concurrent checks** with a configurable worker pool
-- **Dead-man's switch** — an outbound heartbeat so you learn if the monitor itself dies
+- **Dead-man's switch**: an outbound heartbeat so you learn if the monitor itself dies
 - **Single-instance locking**, so overlapping runs can never double-alert or race state
 - **Automatic log rotation** and database retention
 
@@ -177,8 +177,8 @@ A malformed record is **reported in the log**, not silently ignored.
 
 ## Richer configuration with `targets.toml`
 
-Copy `targets.toml.example` to `targets.toml` when you need per-target options —
-content checks, custom headers, methods, per-target timeouts:
+Copy `targets.toml.example` to `targets.toml` when you need per-target options,
+such as content checks, custom headers, methods or per-target timeouts:
 
 ```toml
 [[website]]
@@ -209,20 +209,20 @@ A target is either **up** or **down**. A transition creates or closes an
 3. **Comes back** → the incident closes and a **RESOLVED** email reports the
    duration. The alert state is destroyed with the incident, so a *new* outage
    ten minutes later alerts immediately.
-4. **Grouping** — every alert raised in one pass is coalesced by registrable
+4. **Grouping**: every alert raised in one pass is coalesced by registrable
    domain, so apex and `www` twins arrive as a single email that still lists each
    target separately.
 
 Guards against false alarms:
 
-- **Overlap** — a second run exits cleanly if one is already in progress.
-- **Monitoring gaps** — after a long silence, alerts carry a banner saying outage
+- **Overlap**: a second run exits cleanly if one is already in progress.
+- **Monitoring gaps**: after a long silence, alerts carry a banner saying outage
   start times are lower bounds.
-- **Monitor-side failure** — if ⩾80% of targets fail at once with DNS/connection
+- **Monitor-side failure**: if ⩾80% of targets fail at once with DNS/connection
   errors, the alert is re-titled to say the monitoring host is the likely cause.
-- **Cold start** — the first run after installation records pre-existing failures
+- **Cold start**: the first run after installation records pre-existing failures
   without paging you about all of them at once.
-- **Flap detection** — a target oscillating up and down is reported once rather
+- **Flap detection**: a target oscillating up and down is reported once rather
   than on every transition.
 
 ## TLS certificates
@@ -231,8 +231,8 @@ Expiry is probed directly over a TLS handshake, at most once every 12 hours per
 host, and warnings fire at `SSL_WARN_DAYS` thresholds (each threshold once).
 
 This is deliberately independent of whatever renews your certificates. If ACME
-renewal silently stops — a permissions problem on the account file, a rate limit,
-a failed challenge — nothing else will tell you until browsers start showing
+renewal silently stops (a permissions problem on the account file, a rate limit,
+a failed challenge), nothing else will tell you until browsers start showing
 warnings. `monitor.py --status` shows days remaining for every monitored host.
 
 ## Data and logs
@@ -247,7 +247,7 @@ Console output is **TTY-aware**: colours only on a terminal, and under cron only
 warnings and above reach stdout. A healthy run therefore writes nothing to
 `cron.log`. Timestamps in the database are UTC; log filenames use local dates.
 
-Retention is automatic — raw check rows are rolled into daily aggregates after
+Retention is automatic: raw check rows are rolled into daily aggregates after
 `DB_RETENTION_DAYS` and the database is vacuumed monthly, so the uptime history
 is permanent while storage stays flat.
 
@@ -281,13 +281,13 @@ no second copy to drift out of date:
 */5 * * * * /home/dds/tools/vpsmonitor/security-watchdog.sh
 ```
 
-Nine checks run on each pass: processes consuming the processor, hidden
-executables in the home directory, random-named directories, executables dropped
-in the temporary directories, processes carrying a known miner or backdoor name,
-crontab entries that fetch or decode something, known malware signatures in the
-shell configuration, outbound connections to a mining pool, and the shell startup
-files, which are reported when they become writable by others or when their
-contents change.
+Nine checks run on each pass: processes that keep the processor busy for a
+quarter of an hour, hidden executables in the home directory, random-named
+directories, executables dropped in the temporary directories, processes
+carrying a known miner or backdoor name, crontab entries that fetch or decode
+something, known malware signatures in the shell configuration, outbound
+connections to a mining pool, and the shell startup files, which are reported
+when they become writable by others or when their contents change.
 
 The processor check measures over a window rather than trusting the per cent that
 `ps` prints. That figure is lifetime processor time divided by lifetime, so for a
@@ -298,6 +298,26 @@ that have already lived `WATCHDOG_CPU_MIN_AGE` seconds, their `utime` and `stime
 are read from `/proc`, and the check waits `WATCHDOG_CPU_WINDOW` seconds and reads
 them again. What it compares against `WATCHDOG_CPU_THRESHOLD` is the processor
 time genuinely consumed during that window.
+
+One busy window is not yet a finding. The rebuild of a website, a language
+server that starts, a task of an agent: each keeps several cores busy for a few
+minutes, and each used to raise an alert. A process is therefore reported only
+when the load lasts. With `r` its share of one core over the window at each
+pass, and `C` the processor time it has consumed, the alert at time `t` needs
+
+```text
+r > WATCHDOG_CPU_THRESHOLD     at every pass since the streak began at t0
+t - t0 ⩾ WATCHDOG_CPU_PERSIST  (15 minutes by default: four passes in a row)
+(C(t) - C(t0)) / (t - t0) > WATCHDOG_CPU_THRESHOLD
+```
+
+The last condition, on the average over the whole streak, keeps out a program
+that happens to be busy at the moments of measurement while idle in between.
+Until the streak is long enough, each pass writes one line `CPU watch:` in the
+log, and no mail goes out. The streaks are kept in `.watchdog-cpu` beside the
+alert file, for the current boot only. A process is known by its number together
+with its start time, so that a reused number cannot inherit a streak, and one
+pass below the threshold starts the count over.
 
 The check of the temporary directories reads the execute bit from the
 permissions, so that it also sees the files of a `noexec` mount, where
@@ -313,6 +333,7 @@ alone would tell anyone reading this script where to hide a miner.
 | `WATCHDOG_CPU_THRESHOLD` | Per cent of one core above which a process is reported | `150` |
 | `WATCHDOG_CPU_MIN_AGE` | Seconds a process must already have lived to be a candidate | `60` |
 | `WATCHDOG_CPU_WINDOW` | Seconds over which its processor use is measured | `15` |
+| `WATCHDOG_CPU_PERSIST` | Seconds a process must stay above the threshold, at every pass and on average, before it is reported (`0` reports a single busy window) | `900` |
 | `WATCHDOG_USER` | Account whose processes are watched | current user |
 | `WATCHDOG_HOME` | Home directory inspected | `$HOME` |
 | `WATCHDOG_TMP_DIRS` | Temporary directories searched for executables, separated by spaces | `/tmp /var/tmp` |
@@ -321,7 +342,9 @@ alone would tell anyone reading this script where to hide a miner.
 
 Three flags help when working on it: `--no-mail` runs every check and suppresses
 the email, `--cpu-only` runs the processor check alone and prints `clean` or the
-finding, and `--verbose` prints the findings to the terminal.
+finding (it reads the streaks but never writes them, so that a test cannot
+disturb the count that cron keeps), and `--verbose` prints the findings, and the
+processes being watched, to the terminal.
 
 A finding is mailed at most once an hour. The rate limiter fingerprints the
 *kind* of finding rather than its text, so a condition that persists across runs
@@ -350,21 +373,29 @@ WATCHDOG_LOG=/tmp/wd-test.log WATCHDOG_ALERT_FILE=/tmp/wd-test-ALERT \
 ```
 
 The tests in `tests/test_watchdog.py` try the check of the temporary directories
-the same way, on a folder of their own given by `WATCHDOG_TMP_DIRS`.
+the same way, on a folder of their own given by `WATCHDOG_TMP_DIRS`, and the
+processor check on a busy program of their own, with a window of one second and
+a persistence of three: busy once, the program is only watched; busy at two
+passes three seconds apart, it is reported; stopped during one pass, it starts
+its count over; with `WATCHDOG_CPU_PERSIST=0` it is reported at once.
 
 Then confirm the processor check is quiet on an idle machine and still sees a
 real offender. Start a busy loop from the home directory (a copy of the shell
 placed in `/tmp` would itself be reported by the watchdog's own five-minute run),
 wait past the minimum age, and run the check with the threshold lowered to match
-a single-core process:
+a single-core process and the persistence switched off:
 
 ```bash
 mkdir -p ~/wdtest && cp "$(command -v bash)" ~/wdtest/zzdecoy
 setsid ~/wdtest/zzdecoy -c 'end=$((SECONDS+150)); while [ $SECONDS -lt $end ]; do :; done' &
 sleep 65
-WATCHDOG_CPU_THRESHOLD=80 /home/dds/tools/vpsmonitor/security-watchdog.sh --cpu-only
+WATCHDOG_CPU_THRESHOLD=80 WATCHDOG_CPU_PERSIST=0 /home/dds/tools/vpsmonitor/security-watchdog.sh --cpu-only
 pkill -x zzdecoy; rm -rf ~/wdtest
 ```
+
+The check prints `HIT` and the description of the decoy. Without
+`WATCHDOG_CPU_PERSIST=0` the same line prints `clean` and the log gains a line
+`CPU watch:`, since the decoy has not been busy for a quarter of an hour.
 
 Deploying an update is `git pull` on `main`. There is no separate install copy,
 so the path in cron does not change. The first clean line appears in the log at
@@ -388,17 +419,17 @@ Development tooling lives in `requirements-dev.txt` and a separate `.venv-dev`.
 **No alerts arriving**
 1. `./venv/bin/python monitor.py --test-email`
 2. Check `logs/monitor_$(date +%Y%m%d).log`
-3. `./venv/bin/python monitor.py --status` — are the targets actually down?
+3. `./venv/bin/python monitor.py --status`: are the targets actually down?
 4. A line `SMTP login refused` in the log means the password is wrong. Fix it
    before the next run: the mail server may ban the address after repeated refusals.
 
-**Too many alerts** — raise `FAILURE_THRESHOLD` to require consecutive failed
+**Too many alerts**: raise `FAILURE_THRESHOLD` to require consecutive failed
 passes, or `ALERT_COOLDOWN` to stretch the escalation ladder.
 
-**False positives** — raise `TIMEOUT`, or add an `expect` string if the site
+**False positives**: raise `TIMEOUT`, or add an `expect` string if the site
 returns a valid but unhelpful page.
 
-**A run seems to be skipped** — that is the single-instance lock. Look for
+**A run seems to be skipped**: that is the single-instance lock. Look for
 "another monitor run is already in progress" in the log.
 
 ## Security
@@ -411,15 +442,15 @@ returns a valid but unhelpful page.
 - Alert emails redact response fields matching `token|secret|key|password` and
   truncate bodies, so API internals are not mailed in cleartext.
 - Use an app-specific password, never your main account password.
-- `data/` is `chmod 700` — it holds an inventory of your infrastructure.
+- `data/` is `chmod 700`, since it holds an inventory of your infrastructure.
 
 ## Contributing
 
 1. Fork and branch.
 2. `make check` must pass.
-3. Add tests for new behaviour — especially anything touching alert scheduling.
+3. Add tests for new behaviour, especially anything touching alert scheduling.
 4. Open a pull request.
 
 ## License
 
-GPL-3.0 — see [LICENSE](LICENSE).
+GPL-3.0, see [LICENSE](LICENSE).
