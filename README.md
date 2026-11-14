@@ -1,3 +1,5 @@
+<!-- Author: Dr. Denys Dutykh (Mathematics Department, Khalifa University of Science and Technology, Abu Dhabi, UAE) -->
+
 # Website Monitor
 
 Website, API and TLS certificate monitoring for Linux servers, with incident
@@ -60,6 +62,7 @@ same second).
 | Command | Purpose |
 |---------|---------|
 | `monitor.py` | One check pass, then exit. The mode to use from cron. |
+| `monitor.py --once` | The same single pass, asked for by name. |
 | `monitor.py --continuous` | Loop forever using `CHECK_INTERVAL`. For systemd/PM2/Docker. |
 | `monitor.py --status` | Print current up/down state, uptime and certificate expiry. |
 | `monitor.py --report daily\|weekly\|monthly` | Email an uptime summary. |
@@ -67,7 +70,9 @@ same second).
 | `monitor.py --test-email` | Verify SMTP settings end to end. |
 | `monitor.py --notify "Subject" --body-file F` | Send an arbitrary message (for other scripts). |
 | `monitor.py --dry-run` | Run checks and update state, but never send email. |
+| `monitor.py --config PATH` | Read the targets from this `targets.toml`, in place of `TARGETS_FILE` or the `targets.toml` beside the script. |
 | `monitor.py -v` / `-q` | More / less console output. |
+| `monitor.py --version` | Print the version and exit. |
 
 ## Configuration
 
@@ -110,6 +115,7 @@ to a `targets.toml` file for per-target options.
 | `SSL_CHECK_ENABLED` | Check certificate expiry | `true` |
 | `SSL_WARN_DAYS` | Warning thresholds, in days | `21,14,7,3,1` |
 | `HEARTBEAT_URL` | Dead-man's-switch ping URL | *(empty)* |
+| `USER_AGENT` | `User-Agent` header of every request | `Website-Monitor/` with the version and the address of this repository |
 | `LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR` | `INFO` |
 | `LOG_RETENTION_DAYS` | Days of uncompressed daily logs | `90` |
 | `LOG_ARCHIVE_DAYS` | Days before gzipped logs are deleted | `365` |
@@ -126,7 +132,7 @@ SMTP_SERVER=mail.example.org
 SMTP_PORT=587
 SMTP_SECURITY=starttls
 SMTP_USERNAME=vpsmonitor@example.org
-SMTP_PASSWORD=a-long-random-password
+SMTP_PASSWORD=<a-long-random-password>
 ALERT_EMAIL=you@example.net
 ```
 
@@ -144,10 +150,12 @@ command line is split like a shell would but run without a shell; the text
 standard input. Alerts, recoveries, certificate warnings and `--notify` messages
 use it, and so does the message about a broken configuration. The test message and
 the daily summary never do, so that a broken mail setting shows as broken. With
-[tg-ping](https://github.com/dutykh/tg-ping) the spare route is a Telegram message:
+[tg-ping](https://github.com/dutykh/tg-ping) the spare route is a Telegram message,
+the program being named by its absolute path, since no shell expands `~` or `$HOME`
+there:
 
 ```text
-FALLBACK_COMMAND=/home/user/tools/tg-ping/bin/tg-ping --warn --title {subject}
+FALLBACK_COMMAND=/path/to/tg-ping/bin/tg-ping --warn --title {subject}
 ```
 
 A message delivered this way is recorded with the state `fallback` in the
@@ -265,7 +273,7 @@ account without duplicating credentials:
 
 ```bash
 ./venv/bin/python monitor.py --notify "[SECURITY] watchdog alert on $(hostname)" \
-                             --body-file /home/dds/logs/security-watchdog.log
+                             --body-file "$HOME/logs/security-watchdog.log"
 ```
 
 ## The security watchdog
@@ -278,7 +286,7 @@ discovered at the next login. It runs from cron every five minutes, directly fro
 no second copy to drift out of date:
 
 ```cron
-*/5 * * * * /home/dds/tools/vpsmonitor/security-watchdog.sh
+*/5 * * * * $HOME/tools/vpsmonitor/security-watchdog.sh
 ```
 
 Nine checks run on each pass: processes that keep the processor busy for a
@@ -338,6 +346,7 @@ alone would tell anyone reading this script where to hide a miner.
 | `WATCHDOG_HOME` | Home directory inspected | `$HOME` |
 | `WATCHDOG_TMP_DIRS` | Temporary directories searched for executables, separated by spaces | `/tmp /var/tmp` |
 | `WATCHDOG_LOG` | Log file | `$HOME/logs/security-watchdog.log` |
+| `WATCHDOG_ALERT_FILE` | File holding the findings while an alert stands, removed by a clean pass; the state of the watchdog (processor streaks, checksums of the shell files, mail stamps) is kept in the same folder | `$HOME/logs/SECURITY_ALERT` |
 | `WATCHDOG_MONITOR_DIR` | Where `monitor.py` and its virtualenv live | `$HOME/tools/vpsmonitor` |
 
 Three flags help when working on it: `--no-mail` runs every check and suppresses
@@ -357,7 +366,7 @@ through. On the host that already carries this repository, point cron at the
 in-repo path and keep the working tree on `main`:
 
 ```cron
-*/5 * * * * /home/dds/tools/vpsmonitor/security-watchdog.sh
+*/5 * * * * $HOME/tools/vpsmonitor/security-watchdog.sh
 ```
 
 A fresh clone on another host is the same idea: check the tree out under
@@ -369,7 +378,7 @@ it reports what you expect, writing to a scratch log so the real one is untouche
 
 ```bash
 WATCHDOG_LOG=/tmp/wd-test.log WATCHDOG_ALERT_FILE=/tmp/wd-test-ALERT \
-  /home/dds/tools/vpsmonitor/security-watchdog.sh --no-mail --verbose
+  $HOME/tools/vpsmonitor/security-watchdog.sh --no-mail --verbose
 ```
 
 The tests in `tests/test_watchdog.py` try the check of the temporary directories
@@ -389,7 +398,7 @@ a single-core process and the persistence switched off:
 mkdir -p ~/wdtest && cp "$(command -v bash)" ~/wdtest/zzdecoy
 setsid ~/wdtest/zzdecoy -c 'end=$((SECONDS+150)); while [ $SECONDS -lt $end ]; do :; done' &
 sleep 65
-WATCHDOG_CPU_THRESHOLD=80 WATCHDOG_CPU_PERSIST=0 /home/dds/tools/vpsmonitor/security-watchdog.sh --cpu-only
+WATCHDOG_CPU_THRESHOLD=80 WATCHDOG_CPU_PERSIST=0 $HOME/tools/vpsmonitor/security-watchdog.sh --cpu-only
 pkill -x zzdecoy; rm -rf ~/wdtest
 ```
 
@@ -450,6 +459,12 @@ returns a valid but unhelpful page.
 2. `make check` must pass.
 3. Add tests for new behaviour, especially anything touching alert scheduling.
 4. Open a pull request.
+
+## How to cite
+
+The file [`CITATION.cff`](CITATION.cff) describes the program for citation, and
+GitHub turns it into a reference, in APA or BibTeX, through the "Cite this
+repository" button of the repository page.
 
 ## License
 

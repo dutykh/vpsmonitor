@@ -1,0 +1,33 @@
+# Dr. Denys Dutykh (Mathematics Department, Khalifa University of Science and Technology, Abu Dhabi, UAE)
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "Website Monitor (vpsmonitor): website, API and TLS certificate monitoring for Linux servers"
+type: software
+authors:
+  - family-names: Dutykh
+    given-names: Denys
+    affiliation: "Khalifa University of Science and Technology"
+    orcid: "https://orcid.org/0000-0001-5247-2788"
+repository-code: "https://github.com/dutykh/vpsmonitor"
+license: GPL-3.0-only
+version: 2.3.0
+date-released: "2026-11-15"
+keywords:
+  - monitoring
+  - uptime-monitoring
+  - website-monitoring
+  - tls-certificates
+  - alerting
+  - sysadmin
+  - vps
+  - linux
+  - systemd
+  - python
+abstract: >-
+  Python program, run from cron or a systemd timer, that checks websites and JSON endpoints and the
+  expiry of their TLS certificates, keeps every outage as an incident with its start, end and
+  duration in SQLite, and sends grouped email alerts with escalating reminders and a message on
+  recovery, through a spare route such as Telegram when the mail cannot be sent. A shell watchdog
+  beside it looks every five minutes for the signs of a crypto-miner or a backdoor on the server,
+  reporting a busy process only when its load lasts, and mails its findings through the same
+  channel.
