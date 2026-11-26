@@ -417,23 +417,38 @@ channels:
 ## The security watchdog
 
 `security-watchdog.sh` ships beside the monitor and uses exactly that channel.
-It looks for the signs of a crypto-miner or a backdoor and mails through the
-monitor's SMTP account (and through its spare route when the mail cannot be sent),
-so that a compromise at three in the morning is not
-discovered at the next login. It runs from cron every five minutes, directly from this repository so there is
-no second copy to drift out of date:
+It looks for the signs of a crypto-miner or a backdoor and hands its findings to
+`monitor.py --notify`, which sends them as `ROUTE_NOTIFY` routes them (and through
+the spare route when they cannot leave), so that a compromise at three in the
+morning is not discovered at the next login. It runs from cron every five
+minutes, directly from this repository so there is no second copy to drift out of
+date:
 
 ```cron
 */5 * * * * $HOME/tools/vpsmonitor/security-watchdog.sh
 ```
 
-Nine checks run on each pass: processes that keep the processor busy for a
-quarter of an hour, hidden executables in the home directory, random-named
-directories, executables dropped in the temporary directories, processes
-carrying a known miner or backdoor name, crontab entries that fetch or decode
-something, known malware signatures in the shell configuration, outbound
-connections to a mining pool, and the shell startup files, which are reported
-when they become writable by others or when their contents change.
+Nine checks run on each pass. Processes that keep the processor busy for a
+quarter of an hour. Hidden executables over 100 KiB directly in the home
+directory. Directories of the home directory with random-looking names of eight
+lowercase letters, apart from common names of that shape (`projects`,
+`dotfiles`, `research` and others) and those listed in `WATCHDOG_IGNORE_DIRS`.
+Executables dropped in the temporary directories. Processes carrying a known
+miner or backdoor name, matched on the whole name, so that an indexer such as
+GNOME's `tracker-miner-fs` is no miner. Crontab entries that fetch something and
+run it (`curl` or `wget` piped to a shell, `bash -c "$(curl …)"`), decode
+something and run it, run a program from a temporary folder (not merely write
+there), use `/dev/tcp`, run an interpreter with a network module on its command
+line, or name a mining pool; comment lines are skipped, and so is the line that
+runs this very script. Known malware signatures in the shell configuration.
+Connections that a process of the account opened to a mining pool, recognised by
+the stratum ports of `WATCHDOG_POOL_PORTS`, since `ss` prints numeric addresses,
+or by a miner's name in the process column; a visitor's connection to a listening
+port of the machine never counts, its own port being random. And the shell
+startup files with the keys that open the account (`.bashrc`, `.profile`,
+`.bash_aliases`, `.zshenv` and their kin, `.ssh/authorized_keys`), symbolic links
+followed, reported when they become writable by others or when their contents
+change.
 
 The processor check measures over a window rather than trusting the per cent that
 `ps` prints. That figure is lifetime processor time divided by lifetime, so for a
@@ -470,9 +485,10 @@ permissions, so that it also sees the files of a `noexec` mount, where
 `find -executable` sees none. Chromium unpacks the components it downloads into
 folders named `org.chromium.Chromium.scoped_dir.XXXXXX` and leaves the execute bit
 on their data files, and Node's compile cache, `node-compile-cache`, is treated
-alike: inside those folders only a program is reported, that is an ELF binary, a
-script opening with `#!`, or a file the watchdog cannot read. A rule on the name
-alone would tell anyone reading this script where to hide a miner.
+alike, and so is `/dev/shm`, where some programs create their shared memory with
+the execute bit: inside those folders only a program is reported, that is an ELF
+binary, a script opening with `#!`, or a file the watchdog cannot read. A rule on
+the name alone would tell anyone reading this script where to hide a miner.
 
 | Variable | Meaning | Default |
 |----------|---------|---------|
@@ -482,10 +498,26 @@ alone would tell anyone reading this script where to hide a miner.
 | `WATCHDOG_CPU_PERSIST` | Seconds a process must stay above the threshold, at every pass and on average, before it is reported (`0` reports a single busy window) | `900` |
 | `WATCHDOG_USER` | Account whose processes are watched | current user |
 | `WATCHDOG_HOME` | Home directory inspected | `$HOME` |
-| `WATCHDOG_TMP_DIRS` | Temporary directories searched for executables, separated by spaces | `/tmp /var/tmp` |
+| `WATCHDOG_TMP_DIRS` | Temporary directories searched for executables, separated by spaces | `/tmp /var/tmp /dev/shm` |
+| `WATCHDOG_IGNORE_DIRS` | Folders of the home directory, by name and separated by spaces, that the check of random names passes over | empty |
+| `WATCHDOG_POOL_PORTS` | Stratum ports of mining pools, separated by spaces | `3333 4444 5555 7777 10128 13333 14433 14444 15555 17777 20128 45700` |
 | `WATCHDOG_LOG` | Log file | `$HOME/logs/security-watchdog.log` |
-| `WATCHDOG_ALERT_FILE` | File holding the findings while an alert stands, removed by a clean pass; the state of the watchdog (processor streaks, checksums of the shell files, mail stamps) is kept in the same folder | `$HOME/logs/SECURITY_ALERT` |
-| `WATCHDOG_MONITOR_DIR` | Where `monitor.py` and its virtualenv live | `$HOME/tools/vpsmonitor` |
+| `WATCHDOG_ALERT_FILE` | File holding the findings while an alert stands, removed by a clean pass; the state of the watchdog (processor streaks, checksums of the shell files, mail stamps, the lock) is kept in the same folder | `$HOME/logs/SECURITY_ALERT` |
+| `WATCHDOG_MONITOR_DIR` | Where `monitor.py` and its virtualenv live | the folder of the script |
+
+These settings come from the environment, or from `WATCHDOG_*` lines in the
+monitor's `.env`, which keeps the settings of one server (the folders it ignores,
+say) out of its crontab and out of this public repository. The file is read line
+by line and never executed: only `WATCHDOG_*` names are taken, quotes and inline
+comments are handled, nothing in a value is expanded but a leading `~/` or
+`$HOME/`, and the environment wins over the file.
+
+The log folder and the state folder are created private to the account when they
+are missing, and a folder that cannot be created stops the pass with a message on
+the standard error and the exit status 1, since nothing could then be recorded,
+compared or sent. Everything the watchdog writes is readable by the account
+alone. A pass that finds the previous one still running stops at once, quietly,
+so that two passes never send the same findings twice.
 
 Three flags help when working on it: `--no-mail` runs every check and suppresses
 the email, `--cpu-only` runs the processor check alone and prints `clean` or the
@@ -493,15 +525,24 @@ finding (it reads the streaks but never writes them, so that a test cannot
 disturb the count that cron keeps), and `--verbose` prints the findings, and the
 processes being watched, to the terminal.
 
-A finding is mailed at most once an hour. The rate limiter fingerprints the
-*kind* of finding rather than its text, so a condition that persists across runs
-is recognised as one condition even though the process identifiers change.
+A finding is sent at most once an hour. The rate limiter fingerprints the sorted
+*kinds* of finding, free of paths and process identifiers, so a condition that
+persists across runs is recognised as one condition even though its details
+change. A change of a startup file is the exception that must not slip through:
+it stays reported at every pass until a message has carried it, so that neither
+a failed mail, nor the hourly limit, nor a hand run with `--no-mail` loses it.
+Every attempt is logged, as `Alert emailed` or as `Mail not sent:` followed by the
+reason (the monitor could not deliver, its configuration is broken, it took more
+than 270 seconds, or there is no monitor in `WATCHDOG_MONITOR_DIR`).
 
 ### Deploying the watchdog to a server
 
-The script is self-contained and has no dependencies beyond the monitor it mails
-through. On the host that already carries this repository, point cron at the
-in-repo path and keep the working tree on `main`:
+The script needs bash 4 or later and the usual tools of a Linux server: `ps` from
+procps, `find`, `awk`, `md5sum`, `crontab`, `grep`, `ss` from iproute2, `flock`
+and `timeout`. A command that is missing is named in the log, when that changes
+and then once an hour, and only the checks that need it are skipped. On the host
+that already carries this repository, point cron at the in-repo path and keep the
+working tree on `main`:
 
 ```cron
 */5 * * * * $HOME/tools/vpsmonitor/security-watchdog.sh
@@ -512,12 +553,19 @@ A fresh clone on another host is the same idea: check the tree out under
 the cron line above (adjust the path if the clone lives elsewhere).
 
 Before trusting a new version, run it once with the email suppressed and confirm
-it reports what you expect, writing to a scratch log so the real one is untouched:
+it reports what you expect, writing its log and its state to a fresh scratch
+folder so that the real ones are untouched:
 
 ```bash
-WATCHDOG_LOG=/tmp/wd-test.log WATCHDOG_ALERT_FILE=/tmp/wd-test-ALERT \
+scratch=$(mktemp -d)
+WATCHDOG_LOG=$scratch/watchdog.log WATCHDOG_ALERT_FILE=$scratch/SECURITY_ALERT \
   $HOME/tools/vpsmonitor/security-watchdog.sh --no-mail --verbose
+rm -rf "$scratch"
 ```
+
+A version that watches more startup files than the previous one replaces the old
+checksums silently at its first pass, instead of reporting the newly watched files
+as changes.
 
 The tests in `tests/test_watchdog.py` try the check of the temporary directories
 the same way, on a folder of their own given by `WATCHDOG_TMP_DIRS`, and the
@@ -534,10 +582,10 @@ a single-core process and the persistence switched off:
 
 ```bash
 mkdir -p ~/wdtest && cp "$(command -v bash)" ~/wdtest/zzdecoy
-setsid ~/wdtest/zzdecoy -c 'end=$((SECONDS+150)); while [ $SECONDS -lt $end ]; do :; done' &
+setsid ~/wdtest/zzdecoy -c 'echo $$ > ~/wdtest/pid; end=$((SECONDS+150)); while [ $SECONDS -lt $end ]; do :; done' &
 sleep 65
 WATCHDOG_CPU_THRESHOLD=80 WATCHDOG_CPU_PERSIST=0 $HOME/tools/vpsmonitor/security-watchdog.sh --cpu-only
-pkill -x zzdecoy; rm -rf ~/wdtest
+kill "$(cat ~/wdtest/pid)"; rm -rf ~/wdtest
 ```
 
 The check prints `HIT` and the description of the decoy. Without

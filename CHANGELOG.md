@@ -105,9 +105,60 @@ the README described while the code did not have them.
 - **The option `--notify` exits 0** when its message was delivered or routed
   nowhere on purpose.
 - **Certificate warnings are of the kind `TLS`**, routed by `ROUTE_TLS`.
-- **The development suite** grows from 115 to over 200 tests, among them the
-  routes, the three forms of summary, the delivery that is retried, flapping, and
-  a server that trickles its answer.
+- **The development suite** grows from 115 to 228 tests, among them the routes,
+  the three forms of summary, the delivery that is retried, flapping, a server
+  that trickles its answer, and twenty-one new tests of the watchdog.
+
+### The security watchdog
+
+An audit of the watchdog found checks that could never fire, alarms on ordinary
+software, findings that could be lost, and settings tied to one machine.
+
+- **The mining-pool check could never fire.** It looked for pool host names in
+  the output of `ss`, which prints numeric addresses. A connection now counts when
+  a process of the account opened it to a peer outside the machine on one of the
+  stratum ports of `WATCHDOG_POOL_PORTS`, a new setting, or when a miner's name
+  stands in its process column. A visitor's connection to a listening port of the
+  machine never counts, since a visitor's own port is random and a busy web server
+  would sooner or later see one from a port of the list.
+- **The crontab check missed the usual droppers and could be bypassed.** It now
+  recognises a fetch piped to a shell (`curl … | sh`, `bash -c "$(curl …)"`,
+  `bash <(curl …)`), a decoding piped to a shell, an interpreter run with a network
+  module, `/dev/tcp`, and a program run from a temporary folder, while a line that
+  merely writes its output there, or names `pool.ntp.org`, raises nothing. Comment
+  lines are skipped, and only the line that runs this script is passed over, where
+  any line containing the word "security-watchdog" used to be.
+- **The default folders were never created.** On a fresh clone `~/logs` did not
+  exist, so nothing was logged, no baseline was kept, and while a finding stood a
+  mail without its text went out at every pass. The log and state folders are now created private to the
+  account, and a folder that cannot be created stops the pass with a message.
+- **A crafted file name could cut an alert short**: a `\c` in a name ended the
+  text of `printf '%b'`. The findings are now printed through `%s`.
+- **A change of a startup file could be lost** to a failed mail, to the hourly
+  limit or to a hand run with `--no-mail`. It now stays reported at every pass
+  until a message has carried it, and the changed files are named in the
+  fingerprint.
+- **False alarms on ordinary systems.** The check of random names matched the
+  home directory itself, for an eight-letter login, and common folders such as
+  `projects`; it now looks inside the home directory only, passes over common
+  names, and takes the names of one's own in `WATCHDOG_IGNORE_DIRS`, a new setting,
+  while the two exclusions of one particular machine are gone. The process name
+  `miner` no longer matches GNOME's indexer `tracker-miner-fs`.
+- **Settings of one's own stay out of the crontab and of the repository.** The
+  `WATCHDOG_*` settings may now stand in the monitor's `.env`, which is read line
+  by line and never executed, the environment winning over the file; the folder of
+  the monitor defaults to the folder of the script.
+- **More is watched.** Startup files reached through a symbolic link,
+  `.bash_aliases`, `.zshenv` and `.ssh/authorized_keys` join the watched files (a
+  changed watch list rebaselines silently once), and `/dev/shm` joins the
+  temporary folders, where only programs are reported.
+- **Robustness.** Overlapping passes no longer run together, state files are
+  written whole, every outcome of a mail is logged with its reason, missing
+  commands are named and only their checks skipped, the files of the watchdog are
+  readable by the account alone, and the fingerprints are built from the sorted
+  kinds of finding, free of paths.
+- **Unchanged on purpose**: the threshold, window and persistence of the processor
+  check.
 
 ## [2.3.0] - 2026-11-06
 
