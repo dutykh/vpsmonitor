@@ -27,6 +27,12 @@ def test_api_dsl_coerces_types(monkeypatch):
     assert api.expected_response == {"ready": True, "count": 5, "ratio": 0.5, "name": "ok"}
 
 
+def test_api_dsl_quoted_values_stay_strings(monkeypatch):
+    monkeypatch.setenv("API_ENDPOINTS", 'A|http://x.y/h|200|ready:"yes",version:"1.0"')
+    api = monitor.Config().api_endpoints[0]
+    assert api.expected_response == {"ready": "yes", "version": "1.0"}
+
+
 def test_malformed_api_record_is_reported_not_silently_dropped(monkeypatch, caplog):
     """A typo used to disable an endpoint with no visible sign at all."""
     monkeypatch.setenv("API_ENDPOINTS", "BrokenRecordNoPipe;Good|http://x.y/h|200")
@@ -113,11 +119,17 @@ def test_duplicate_target_names_rejected(monkeypatch):
 @pytest.mark.parametrize("url,expected", [
     ("https://example.com", "example.com"),
     ("https://www.example.com", "example.com"),
-    ("https://app.example.com", "example.com"),
-    ("https://www.app.example.com", "example.com"),
-    ("https://deep.sub.example.org", "example.org"),
+    ("https://app.example.com", "app.example.com"),
+    ("https://www.app.example.com", "app.example.com"),
+    ("https://deep.sub.example.org", "deep.sub.example.org"),
     ("http://127.0.0.1:8000/api", "127.0.0.1"),
     ("http://localhost:9000/health", "localhost"),
+    ("http://[::1]:8000/health", "::1"),
+    ("https://Example.COM.", "example.com"),
+    ("https://www.com", "www.com"),
+    ("example.org:8443", "example.org"),
 ])
-def test_grouping_pairs_apex_and_www(url, expected):
-    assert monitor.registrable_domain(url) == expected
+def test_site_pairs_apex_and_www_and_keeps_subdomains_apart(url, expected):
+    """The old key, the last two labels, announced an outage of a subdomain (a
+    photo site, an API) as an outage of the main domain."""
+    assert monitor.site_of(url) == expected

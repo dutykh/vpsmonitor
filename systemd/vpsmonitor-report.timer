@@ -1,5 +1,7 @@
+# Website Monitor - when the daily summary is sent
+# Author: Dr. Denys Dutykh (Khalifa University of Science and Technology, Abu Dhabi, UAE)
 [Unit]
-Description=Daily uptime summary email
+Description=Daily uptime summary
 
 [Timer]
 OnCalendar=*-*-* 08:00:00

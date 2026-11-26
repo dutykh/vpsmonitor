@@ -10,8 +10,8 @@ authors:
     orcid: "https://orcid.org/0000-0001-5247-2788"
 repository-code: "https://github.com/dutykh/vpsmonitor"
 license: GPL-3.0-only
-version: 2.3.0
-date-released: "2026-11-15"
+version: 2.4.0
+date-released: "2026-11-26"
 keywords:
   - monitoring
   - uptime-monitoring
@@ -26,8 +26,11 @@ keywords:
 abstract: >-
   Python program, run from cron or a systemd timer, that checks websites and JSON endpoints and the
   expiry of their TLS certificates, keeps every outage as an incident with its start, end and
-  duration in SQLite, and sends grouped email alerts with escalating reminders and a message on
-  recovery, through a spare route such as Telegram when the mail cannot be sent. A shell watchdog
-  beside it looks every five minutes for the signs of a crypto-miner or a backdoor on the server,
-  reporting a busy process only when its load lasts, and mails its findings through the same
-  channel.
+  duration in SQLite, and sends grouped alerts with escalating reminders and a message on
+  recovery, each kind of message by the route one chooses (email, a command of one's own such as
+  a chat client, or both), sending again what could not be delivered and falling back on a spare
+  route when the mail cannot be sent. It recognises a flapping target, and writes daily, weekly
+  and monthly summaries as an email table, a short message for a chat, or JSON for other
+  programs. A shell watchdog beside it looks every five minutes for the signs of a crypto-miner
+  or a backdoor on the server, reporting a busy process only when its load lasts, and sends its
+  findings through the same channels.

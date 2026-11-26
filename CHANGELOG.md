@@ -3,6 +3,112 @@
 All notable changes to this project are documented here.
 This project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.4.0] - 2026-11-26
+
+Each kind of message now takes the route one chooses, summaries can be printed for
+a chat or for another program, and an audit of the whole program repaired the
+alerts that could be lost, the history that could vanish, and the features that
+the README described while the code did not have them.
+
+### Added
+
+- **A route per kind of message.** The settings `ROUTE_DOWN`, `ROUTE_RESOLVED`,
+  `ROUTE_TLS`, `ROUTE_SUMMARY` and `ROUTE_NOTIFY` name the channels of their kind:
+  `email`, `command`, both, or `none`. All default to `email`, so a configuration
+  written for an earlier version behaves as before. The command channel runs
+  `MESSAGE_COMMAND` without a shell, with `{subject}`, `{kind}` and `{level}`
+  replaced in one pass and the body on its standard input. The mail settings are
+  required only when a route names email, so a server without mail can run on
+  commands alone. The option `--test-command` tries the command, and `--status`
+  names the routes in force.
+- **Summaries for a chat and for other programs.** The option `--report` takes
+  `--format brief`, a short message that opens with the verdict and then names only
+  what needs attention, and `--format json`; with `--print` the summary is printed
+  instead of sent, so that another scheduler can deliver it. Every summary says
+  when the monitor itself has stopped completing its checks.
+- **Flap detection, which the README described and the code never had**: its
+  scoring function was never called. A target whose last `FLAP_WINDOW` checks (12)
+  hold `FLAP_CHANGES` changes of state (6) is announced once as flapping; while it
+  flaps, an outage of it is announced only once it has lasted `FLAP_HOLD` seconds
+  (900), and one message says when it is steady again.
+- **The settings `SLOW_THRESHOLD_MS` and `ALERT_COOLDOWN` do what the README
+  said.** Both were read and never used. The first now flags the slow targets in
+  every summary, the second sets the scale of the whole reminder ladder (3600, the
+  default, keeps the ladder as it was).
+- **A sender of its own, `SMTP_FROM`, and mail without a login**, for providers
+  whose login is not an address and for a local relay.
+
+### Fixed
+
+- **An alert whose mail failed was lost.** The schedule moved on as soon as an
+  alert was decided, so the first message after a failed DOWN was a STILL DOWN an
+  hour later, or a RESOLVED for an outage nobody had been told about. An
+  undelivered alert is now sent again at the next pass, an undelivered recovery is
+  tried again for a day, an undelivered certificate warning is put back, and a dry
+  run leaves every alert to the first real run.
+- **An outage of a subdomain was announced as an outage of its parent domain.**
+  Alerts were grouped by the last two labels of the host, so an outage of a photo
+  site or of an API on a subdomain arrived titled with the main domain. They are
+  now grouped by site, the host without a leading `www.`, which still pairs apex
+  and `www` twins.
+- **One typo in the configuration sent a notice at every run**, 288 a day, and
+  put it in the place of the security watchdog's messages. The notice now goes out
+  once, then every six hours while the same error lasts. The option `--notify`
+  needs only the channels, and when even those are broken it still carries the
+  message handed to it, by the raw settings.
+- **A server trickling its answer could stop all monitoring.** The body was read
+  without a deadline, and the lock of the stuck run kept every later run from
+  checking anything. A body is now read within `TIMEOUT` and up to 4 MiB.
+- **A trial run with another targets file deleted the history of the real
+  targets**, by cascade. A target absent from the configuration now leaves the
+  summaries at once and keeps its history for a week; a dry run removes nothing.
+- **Certificates.** A failed probe wiped the stored expiry and warning stage, so
+  that the host vanished from the summaries and a warning already sent came again;
+  the port of the address was ignored; the certificates of hosts no longer
+  monitored stayed listed, their days running down. All three are repaired.
+- **Summaries.** An outage begun before the period was left out; an empty
+  database read as 100% uptime; the p95 was the maximum whenever the number of
+  checks was a multiple of 20; the roll-up of old checks replaced, instead of adding
+  up, a day split between two passes.
+- **Escalation after a long gap.** Past the last fixed rung, a monitor back from
+  days of silence sent one reminder per missed day within half an hour.
+- **A lost incident pointer wedged the engine.** A run killed between two writes
+  left an open incident that nothing pointed to, after which every pass failed
+  while that target was down. The open incident is now found by itself, and the
+  error of one target no longer stops a run.
+- **Secrets and injected markup.** The HTML part of a message placed the servers'
+  text unescaped, so a response could put a link or an image in an alert; secrets
+  nested in a response, the password of an address and secret query parameters
+  appeared in clear. All are now escaped, redacted or masked, in messages,
+  summaries and logs.
+- **Mistakes in `targets.toml` were accepted without a word.** Unknown tables and
+  keys are reported, quoted numbers and booleans mean what they say, unreadable
+  values and invalid regular expressions are refused, and an `Accept` header of
+  one's own is kept.
+- **Logs.** Rotation by renaming could leave a long-running process writing into
+  yesterday's file, archives counted their age from the day of their compression,
+  and every request to a `verify_ssl = false` target printed a warning into
+  `cron.log`. Each invocation now writes into the file of its day, archives keep
+  the age of their log, and the warning is silenced for the targets that asked for
+  it. The monitor creates its files readable by their owner only.
+- **Smaller corrections.** The gap banner had its logic backwards (after a gap an
+  outage may have begun earlier than shown, not later); an alert raised while the
+  monitoring host is suspected now says so in its subject, as the README claimed;
+  with `FAILURE_THRESHOLD` above 1 an outage is dated from its first failed check;
+  the certificate warning no longer describes one particular reverse proxy; a
+  Message-ID derived from the dedup key lets a mail client collapse a duplicate.
+
+### Changed
+
+- **Subjects** read `[DOWN] photo.example.com: 2 targets failing` and
+  `[Daily] Uptime 100.00%, no incident`, with proper plurals and without dashes.
+- **The option `--notify` exits 0** when its message was delivered or routed
+  nowhere on purpose.
+- **Certificate warnings are of the kind `TLS`**, routed by `ROUTE_TLS`.
+- **The development suite** grows from 115 to over 200 tests, among them the
+  routes, the three forms of summary, the delivery that is retried, flapping, and
+  a server that trickles its answer.
+
 ## [2.3.0] - 2026-11-06
 
 The watchdog reports a busy processor only when the load lasts.

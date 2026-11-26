@@ -91,13 +91,14 @@ Installation complete.
 
 Next steps:
   1. Verify alerting:      ./venv/bin/python monitor.py --test-email
+                           (and --test-command when a ROUTE_* names the command channel)
   2. See current state:    ./venv/bin/python monitor.py --status
   3. Schedule it (crontab -e):
 
      # Website monitor - checks every 5 minutes (safe: runs are lock-guarded)
      */5 * * * * cd ${HERE} && ${HERE}/venv/bin/python monitor.py >> ${HERE}/logs/cron.log 2>&1
 
-     # Daily uptime summary at 08:00
+     # Daily uptime summary at 08:00 (add --format brief for a chat)
      0 8 * * * cd ${HERE} && ${HERE}/venv/bin/python monitor.py --report daily >> ${HERE}/logs/cron.log 2>&1
 
   A systemd timer is also provided (see systemd/ and the README).

@@ -1,3 +1,10 @@
+# Website Monitor - daily uptime summary, sent by ROUTE_SUMMARY
+# Author: Dr. Denys Dutykh (Khalifa University of Science and Technology, Abu Dhabi, UAE)
+#
+# For the short form meant for a chat or a phone, add --format brief and route
+# the summaries to the command channel (ROUTE_SUMMARY=command). When another
+# scheduler delivers the summary instead, by running
+# "monitor.py --report daily --print --format brief", disable this timer.
 [Unit]
 Description=Website Monitor - daily uptime summary
 After=network-online.target

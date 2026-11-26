@@ -153,11 +153,12 @@ def test_spare_route_failing_counts_as_failure(monkeypatch, no_sleep):
 def test_spare_route_is_recorded_and_not_repeated(spare, db, monkeypatch, no_sleep):
     monkeypatch.setattr(monitor, "_smtp_connect", unreachable)
     notifier = monitor.EmailNotifier(monitor.Config(), db)
-    assert notifier.send("[SSL] a", "b", kind="SSL", dedup_key="SSL:a:day") is True
-    row = db.query_one("SELECT state, last_error FROM notifications WHERE dedup_key=?",
-                       ("SSL:a:day",))
+    assert notifier.send("[TLS] a", "b", kind="TLS", dedup_key="TLS:a:day") is True
+    row = db.query_one("SELECT state, last_error, channels FROM notifications "
+                       "WHERE dedup_key=?", ("TLS:a:day",))
     assert row["state"] == "fallback" and "down" in row["last_error"]
-    assert notifier.send("[SSL] a", "b", kind="SSL", dedup_key="SSL:a:day") is False
+    assert row["channels"] == "fallback"
+    assert notifier.send("[TLS] a", "b", kind="TLS", dedup_key="TLS:a:day") is False
     assert spare.read_text().count("SUBJECT=") == 1
 
 

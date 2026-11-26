@@ -45,10 +45,10 @@ def test_schedule_does_not_compress_after_firing_early():
 
 
 def test_escalation_is_monotonic_and_unbounded():
-    count = 0
+    count, offset = 0, 0.0
     offsets = []
-    for step in range(12):
-        count, offset = monitor.plan_next_notification(offset if step else 0.0, count)
+    for _step in range(12):
+        count, offset = monitor.plan_next_notification(offset, count)
         offsets.append(offset)
     assert offsets == sorted(offsets)
     assert offsets[-1] > 51 * 3600
@@ -67,11 +67,32 @@ def test_long_gap_jumps_to_correct_step_without_bursting():
     assert offset == 51 * 3600
 
 
-def test_flap_score_ignores_sustained_outage():
-    assert monitor.flap_score([False] * 12) == 0.0
-    assert monitor.flap_score([True] * 12) == 0.0
-    assert monitor.flap_score([True, False] * 6) == 1.0
+def test_changes_ignore_a_sustained_outage():
+    assert monitor.count_changes([False] * 12) == 0
+    assert monitor.count_changes([True] * 12) == 0
+    assert monitor.count_changes([True, False] * 6) == 11
+    assert monitor.count_changes([True, False, True]) == 2
+    assert monitor.count_changes([]) == 0
 
 
-def test_flap_score_needs_minimum_samples():
-    assert monitor.flap_score([True, False, True]) == 0.0
+def test_long_gap_past_the_ladder_sends_one_reminder_not_a_burst():
+    """A monitor off from 30 h to 200 h used to send seven reminders in half an
+    hour on its return, one per daily rung it had missed."""
+    count, offset = monitor.plan_next_notification(200 * 3600, 6)
+    assert offset > 200 * 3600
+    assert monitor.is_notification_due(200 * 3600 + 300, offset) is False
+
+
+def test_daily_tail_keeps_its_rhythm():
+    count, offset = monitor.plan_next_notification(51 * 3600 - 3, 6)
+    assert offset == 75 * 3600
+    count, offset = monitor.plan_next_notification(75 * 3600 - 3, count)
+    assert offset == 99 * 3600
+
+
+def test_alert_cooldown_scales_the_ladder():
+    """ALERT_COOLDOWN was read and never used; it now sets the first reminder."""
+    count, offset = monitor.plan_next_notification(0.0, 0, scale=2.0)
+    assert offset == 2 * 3600
+    count, offset = monitor.plan_next_notification(2 * 3600 - 3, count, scale=2.0)
+    assert offset == 6 * 3600

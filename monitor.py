@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Website Monitor - production website / API / TLS monitoring with email alerting.
+Website Monitor - production website / API / TLS monitoring with alerting.
 
 Monitors websites and JSON API endpoints, tracks incidents in SQLite, and sends
-grouped email alerts on failure and on recovery.
+grouped alerts on failure and on recovery, by email, through a command of one's
+own (a chat client, a push service), or both, as each kind of message is routed.
 
 Author: Dr. Denys Dutykh (Khalifa University of Science and Technology, Abu Dhabi, UAE)
 License: GPL-3.0
@@ -14,9 +15,10 @@ from __future__ import annotations
 import argparse
 import fcntl
 import gzip
+import hashlib
 import json
+import math
 import logging
-import logging.handlers
 import os
 import re
 import shlex
@@ -35,12 +37,14 @@ from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.utils import formatdate, make_msgid, parseaddr
+from html import escape as _esc
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 from urllib.parse import urlparse
 
 import requests
+import urllib3
 from dotenv import load_dotenv
 from requests.exceptions import RequestException, SSLError, Timeout
 
@@ -49,7 +53,7 @@ try:  # Python 3.11+
 except ModuleNotFoundError:  # pragma: no cover
     tomllib = None  # type: ignore[assignment]
 
-__version__ = "2.3.0"
+__version__ = "2.4.0"
 
 # The project root is the directory holding this script, NOT the current working
 # directory. The previous version resolved logs/ and .env relative to CWD, which
@@ -59,7 +63,6 @@ LOG_DIR = BASE_DIR / "logs"
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "monitor.db"
 LOCK_PATH = DATA_DIR / ".monitor.lock"
-LEGACY_HISTORY = LOG_DIR / "alert_history.json"
 
 load_dotenv(BASE_DIR / ".env")
 
@@ -100,43 +103,91 @@ def human_duration(seconds: float) -> str:
     return " ".join(parts)
 
 
-def registrable_domain(url_or_host: str) -> str:
-    """Group key for coalescing alerts: example.com and www.example.com share one.
+def site_of(url_or_host: str) -> str:
+    """The site a target belongs to: its host name, lower-cased, without the port
+    and without a leading 'www.'.
 
-    Deliberately simple (no PSL dependency): strip a leading 'www.' and keep the
-    last two labels. Good enough to pair apex/www twins, which is the actual goal.
+    Alerts are grouped by site, which pairs apex and www twins (example.com and
+    www.example.com) and keeps distinct subdomains apart. The previous key, the
+    last two labels of the host, announced an outage of photo.example.com or of
+    api.example.com as an outage of example.com.
     """
-    host = url_or_host
-    if "://" in host:
-        host = urlparse(host).hostname or host
-    host = (host or "").lower().split(":")[0]
-    if host.startswith("www."):
+    if "://" in url_or_host:
+        host = urlparse(url_or_host).hostname or ""
+    else:
+        host = url_or_host
+        if host.count(":") == 1:          # host:port, but not an IPv6 literal
+            host = host.split(":", 1)[0]
+    host = host.lower().rstrip(".")
+    if host.startswith("www.") and host.count(".") >= 2:
         host = host[4:]
-    if _IP_RE.match(host):
+    return host
+
+
+def cert_key(host: str, port: Optional[int]) -> str:
+    """'example.com' for port 443, 'example.com:8443' or '[::1]:8443' otherwise."""
+    if not port or port == 443:
         return host
-    labels = host.split(".")
-    return ".".join(labels[-2:]) if len(labels) >= 2 else host
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
 
 
-_IP_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+def split_cert_key(key: str) -> Tuple[str, int]:
+    if key.startswith("["):
+        host, _, rest = key[1:].partition("]")
+        return host, int(rest[1:]) if rest.startswith(":") and rest[1:].isdigit() else 443
+    if key.count(":") == 1:
+        host, port = key.split(":")
+        if port.isdigit():
+            return host, int(port)
+    return key, 443
+
+
+def plural(count: int, word: str, many: Optional[str] = None) -> str:
+    """'1 target', '2 targets'."""
+    return f"{count} {word if count == 1 else (many or word + 's')}"
+
+
 _SECRET_KEY_RE = re.compile(r"(token|secret|key|password|passwd|auth|cookie)", re.I)
+
+
+def _redacted(data: Any, depth: int = 0) -> Any:
+    """Replace the values of secret-looking keys, at every level of nesting."""
+    if depth > 20:
+        return "<nested too deep>"
+    if isinstance(data, dict):
+        return {k: ("<redacted>" if _SECRET_KEY_RE.search(str(k)) else _redacted(v, depth + 1))
+                for k, v in data.items()}
+    if isinstance(data, (list, tuple)):
+        return [_redacted(v, depth + 1) for v in data]
+    return data
 
 
 def redact(data: Any, limit: int = 600) -> str:
     """Render response data for an email without leaking credentials or flooding it."""
     if data is None:
         return "N/A"
-    if isinstance(data, dict):
-        safe = {
-            k: ("<redacted>" if _SECRET_KEY_RE.search(str(k)) else v)
-            for k, v in data.items()
-        }
-        text = json.dumps(safe, indent=2, default=str)
+    if isinstance(data, str):
+        text = mask_secrets(data)
     else:
-        text = json.dumps(data, indent=2, default=str) if not isinstance(data, str) else data
+        text = json.dumps(_redacted(data), indent=2, default=str)
     if len(text) > limit:
         text = text[:limit] + f"\n... (truncated, {len(text)} chars total)"
     return text
+
+
+_URL_USERINFO_RE = re.compile(r"(\b[a-z][a-z0-9+.-]*://[^/\s:@]+:)[^/\s@]+@", re.I)
+_SECRET_PARAM_RE = re.compile(
+    r"([?&;](?:[^=&\s]*(?:token|secret|key|password|passwd|auth|signature|sig|session)"
+    r"[^=&\s]*)=)[^&\s'\"<>]+", re.I)
+
+
+def mask_secrets(text: Optional[str]) -> str:
+    """Mask the password of a URL (user:***@host) and the values of secret-looking
+    query parameters (?api_key=***), wherever a URL is shown: alert bodies, logs,
+    summaries and the error texts of the HTTP library, which repeat the URL."""
+    if not text:
+        return text or ""
+    return _SECRET_PARAM_RE.sub(r"\1***", _URL_USERINFO_RE.sub(r"\1***@", text))
 
 
 # ---------------------------------------------------------------------------
@@ -172,12 +223,67 @@ class ColoredFormatter(logging.Formatter):
         return self._formatters.get(record.levelno, self._default).format(record)
 
 
-def _daily_namer(default_name: str) -> str:
-    """Keep the historical logs/monitor_YYYYMMDD.log naming under rotation."""
-    base, _, suffix = default_name.rpartition(".")
-    # base is '<dir>/monitor.log', suffix is '2026-09-17'
-    directory = os.path.dirname(base)
-    return os.path.join(directory, f"monitor_{suffix.replace('-', '')}.log")
+class DailyFileHandler(logging.Handler):
+    """Append each record to logs/monitor_YYYYMMDD.log, the file of its local date.
+
+    Every invocation (the five-minute pass, a summary, --notify, a --continuous
+    loop) writes to the dated file of the moment and nothing is ever renamed.
+    Rotation by renaming, as before, let a short invocation rotate first after
+    midnight, after which a long-running process kept writing into yesterday's
+    file and never rotated again.
+    """
+
+    def __init__(self, directory: Path, prefix: str = "monitor_"):
+        super().__init__()
+        self.directory = directory
+        self.prefix = prefix
+        self._day: Optional[str] = None
+        self._stream: Optional[Any] = None
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            day = time.strftime("%Y%m%d", time.localtime(record.created))
+            if day != self._day or self._stream is None:
+                if self._stream is not None:
+                    self._stream.close()
+                self._stream = open(self.directory / f"{self.prefix}{day}.log", "a",
+                                    encoding="utf-8")
+                self._day = day
+            self._stream.write(self.format(record) + "\n")
+            self._stream.flush()
+        except Exception:  # noqa: BLE001 - logging must never raise
+            self.handleError(record)
+
+    def close(self) -> None:
+        self.acquire()
+        try:
+            if self._stream is not None:
+                self._stream.close()
+                self._stream = None
+        finally:
+            self.release()
+        super().close()
+
+
+def _adopt_rotating_log() -> None:
+    """Fold the monitor.log of the rotating handler of earlier versions into the
+    dated file of its last day, once; the rename makes the move happen once even
+    when two processes start at the same moment."""
+    old = LOG_DIR / "monitor.log"
+    if not old.exists():
+        return
+    moving = LOG_DIR / f"monitor.log.adopting-{os.getpid()}"
+    try:
+        os.rename(old, moving)
+    except OSError:
+        return
+    try:
+        day = time.strftime("%Y%m%d", time.localtime(moving.stat().st_mtime))
+        with open(moving, "rb") as src, open(LOG_DIR / f"monitor_{day}.log", "ab") as dst:
+            shutil.copyfileobj(src, dst)
+        moving.unlink()
+    except OSError as exc:
+        logger.warning("Could not fold the old monitor.log into the daily log: %s", exc)
 
 
 def setup_logging(log_level: str = "INFO", console_level: Optional[str] = None,
@@ -204,13 +310,9 @@ def setup_logging(log_level: str = "INFO", console_level: Optional[str] = None,
         console.setLevel(logging.INFO if is_tty else logging.WARNING)
     logger.addHandler(console)
 
-    # Rotating daily file. Rotation is what fixes the --continuous mode never
-    # rolling over at midnight, and gives retention for free.
-    file_handler = logging.handlers.TimedRotatingFileHandler(
-        LOG_DIR / "monitor.log", when="midnight", backupCount=retention_days,
-        encoding="utf-8", utc=False,
-    )
-    file_handler.namer = _daily_namer
+    # One file per local day, written directly; compress_old_logs() keeps them.
+    _adopt_rotating_log()
+    file_handler = DailyFileHandler(LOG_DIR)
     file_handler.setFormatter(
         logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s",
                           datefmt="%Y-%m-%d %H:%M:%S")
@@ -227,9 +329,14 @@ def compress_old_logs(retention_days: int = 90, archive_days: int = 365) -> None
     now = time.time()
     try:
         for path in LOG_DIR.glob("monitor_*.log"):
-            if now - path.stat().st_mtime > retention_days * 86400:
-                with open(path, "rb") as src, gzip.open(f"{path}.gz", "wb") as dst:
+            stat = path.stat()
+            if now - stat.st_mtime > retention_days * 86400:
+                archive = Path(f"{path}.gz")
+                with open(path, "rb") as src, gzip.open(archive, "wb") as dst:
                     shutil.copyfileobj(src, dst)
+                # The archive keeps the age of its log, so that LOG_ARCHIVE_DAYS
+                # counts from the day logged, not from the day of compression.
+                os.utime(archive, (stat.st_atime, stat.st_mtime))
                 path.unlink()
         if archive_days > 0:
             for path in LOG_DIR.glob("monitor_*.log.gz"):
@@ -262,12 +369,12 @@ class Target:
     headers: Dict[str, str] = field(default_factory=dict)
     verify_ssl: bool = True
     allow_redirects: Optional[bool] = None
-    timeout: Optional[int] = None
+    timeout: Optional[float] = None
     check_cert: Optional[bool] = None
 
     @property
-    def group(self) -> str:
-        return registrable_domain(self.url)
+    def site(self) -> str:
+        return site_of(self.url)
 
     @property
     def host(self) -> str:
@@ -276,6 +383,15 @@ class Target:
     @property
     def is_https(self) -> bool:
         return urlparse(self.url).scheme == "https"
+
+    @property
+    def cert_key(self) -> str:
+        """The host whose certificate is probed, with its port when it is not 443."""
+        try:
+            port = urlparse(self.url).port
+        except ValueError:
+            port = None
+        return cert_key(self.host, port)
 
     def follows_redirects(self) -> bool:
         if self.allow_redirects is not None:
@@ -289,8 +405,12 @@ class Target:
 
 
 def _coerce(value: str) -> Any:
-    """Coerce a config string to bool/int/float where unambiguous."""
-    low = value.strip().lower()
+    """Coerce a config string to bool/int/float where unambiguous; a value in
+    double quotes stays a string ("yes", "1.0")."""
+    stripped = value.strip()
+    if len(stripped) >= 2 and stripped[0] == stripped[-1] == '"':
+        return stripped[1:-1]
+    low = stripped.lower()
     if low in ("true", "yes"):
         return True
     if low in ("false", "no"):
@@ -304,6 +424,53 @@ def _coerce(value: str) -> Any:
         return float(text)
     except ValueError:
         return value
+
+
+TOML_KEYS = frozenset((
+    "name", "url", "expected_status", "expected_response", "expect", "expect_text",
+    "expect_regex", "method", "headers", "verify_ssl", "allow_redirects", "timeout",
+    "check_cert",
+))
+
+
+def _toml_bool(entry: Dict[str, Any], key: str, default: Optional[bool],
+               where: str) -> Optional[bool]:
+    """A boolean of targets.toml; the strings "true" and "false" are accepted, since
+    verify_ssl = "false" used to mean True."""
+    value = entry.get(key, default)
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    raise ConfigError(f"{where}: {key} must be true or false, not {value!r}")
+
+
+def _toml_int(entry: Dict[str, Any], key: str, default: Optional[int],
+              where: str) -> Optional[int]:
+    """An integer of targets.toml; a quoted number such as "200" is accepted, since
+    it used to fail every check with 'Expected status 200, got 200'."""
+    value = entry.get(key, default)
+    if value is None or (isinstance(value, int) and not isinstance(value, bool)):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    raise ConfigError(f"{where}: {key} must be a whole number, not {value!r}")
+
+
+def _toml_seconds(entry: Dict[str, Any], key: str, where: str) -> Optional[float]:
+    value = entry.get(key)
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = float(value)
+        except ValueError:
+            value = None
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+        return value
+    raise ConfigError(f"{where}: {key} must be a positive number of seconds")
 
 
 def _env_int(key: str, default: int) -> int:
@@ -336,10 +503,45 @@ def _env_list(key: str, default: Sequence[int]) -> List[int]:
     return sorted(out, reverse=True) or list(default)
 
 
+# ---------------------------------------------------------------------------
+# Kinds of message and their routes
+# ---------------------------------------------------------------------------
+
+# Each kind of message has a route, ROUTE_<KIND>, naming the channels that carry
+# it: "email", "command" (MESSAGE_COMMAND), both, or "none".
+ROUTED_KINDS: Tuple[str, ...] = ("DOWN", "RESOLVED", "TLS", "SUMMARY", "NOTIFY")
+CHANNELS: Tuple[str, ...] = ("email", "command")
+# Kinds that travel with another kind: a flapping notice is part of the outage
+# alerts, the notice that a target is steady again part of the recoveries.
+ROUTE_OF: Dict[str, str] = {"FLAP": "DOWN", "STEADY": "RESOLVED"}
+# The {level} handed to a command, in the vocabulary of chat notifiers.
+MESSAGE_LEVELS: Dict[str, str] = {
+    "DOWN": "error", "BROKEN": "error", "FLAP": "warn", "TLS": "warn", "NOTIFY": "warn",
+    "RESOLVED": "success", "STEADY": "success", "SUMMARY": "info", "TEST": "info",
+}
+
+
+def _env_route(key: str) -> List[str]:
+    """Parse ROUTE_<KIND>: channels separated by commas, '+' or spaces, or 'none'."""
+    raw = (os.getenv(key) or "").strip().lower()
+    if not raw:
+        return ["email"]
+    parts = [part for part in re.split(r"[\s,+]+", raw) if part]
+    if "none" in parts:
+        if len(parts) > 1:
+            raise ConfigError(f"{key}={raw!r}: 'none' cannot be combined with a channel")
+        return []
+    for part in parts:
+        if part not in CHANNELS:
+            raise ConfigError(f"{key}={raw!r}: unknown channel {part!r} "
+                              "(use email, command, both separated by a comma, or none)")
+    return list(dict.fromkeys(parts))
+
+
 class Config:
     """Runtime configuration, from environment/.env plus optional targets.toml."""
 
-    def __init__(self, targets_file: Optional[Path] = None):
+    def __init__(self, targets_file: Optional[Path] = None, check_targets: bool = True):
         self.smtp_server = (os.getenv("SMTP_SERVER") or "").strip()
         self.smtp_port = _env_int("SMTP_PORT", 587)
         self.smtp_security = (os.getenv("SMTP_SECURITY", "starttls") or "starttls").lower()
@@ -349,7 +551,14 @@ class Config:
         self.alert_email = [
             addr.strip() for addr in (os.getenv("ALERT_EMAIL") or "").split(",") if addr.strip()
         ]
+        # The sender: SMTP_FROM, else the login, which most servers require anyway.
+        self.smtp_from = ((os.getenv("SMTP_FROM") or "").strip()
+                          or (self.smtp_username or "").strip())
         self.fallback_command = (os.getenv("FALLBACK_COMMAND") or "").strip()
+        self.message_command = (os.getenv("MESSAGE_COMMAND") or "").strip()
+        self.routes: Dict[str, List[str]] = {
+            kind: _env_route(f"ROUTE_{kind}") for kind in ROUTED_KINDS
+        }
 
         self.timeout = _env_int("TIMEOUT", 30)
         self.max_retries = max(1, _env_int("MAX_RETRIES", 3))
@@ -359,6 +568,12 @@ class Config:
         self.failure_threshold = max(1, _env_int("FAILURE_THRESHOLD", 1))
         self.group_alerts = _env_bool("GROUP_ALERTS", True)
         self.slow_threshold_ms = _env_int("SLOW_THRESHOLD_MS", 0)
+
+        # Flapping: FLAP_CHANGES changes of state over the last FLAP_WINDOW checks
+        # (0 turns it off); while flapping, an outage waits FLAP_HOLD seconds.
+        self.flap_changes = max(0, _env_int("FLAP_CHANGES", 6))
+        self.flap_window = max(2, _env_int("FLAP_WINDOW", 12))
+        self.flap_hold = max(0, _env_int("FLAP_HOLD", 900))
 
         self.ssl_check_enabled = _env_bool("SSL_CHECK_ENABLED", True)
         self.ssl_warn_days = _env_list("SSL_WARN_DAYS", (21, 14, 7, 3, 1))
@@ -382,7 +597,9 @@ class Config:
             self.targets = self._load_env_targets()
             self.targets_source = ".env"
 
-        self.validate()
+        # --notify and the test messages need the channels, not the targets: a
+        # typo in a URL must not stop the security watchdog's message.
+        self.validate(check_targets)
 
     # -- target loading ----------------------------------------------------
 
@@ -473,50 +690,112 @@ class Config:
         except (OSError, ValueError) as exc:
             raise ConfigError(f"Could not parse {path}: {exc}") from exc
 
+        for table in data:
+            if table not in ("website", "api"):
+                logger.error("Unknown table %r in %s, ignored: the tables are "
+                             "[[website]] and [[api]]", table, path)
+
         targets: List[Target] = []
-        for kind, key in (("website", "website"), ("api", "api")):
-            for entry in data.get(key, []) or []:
+        for kind in ("website", "api"):
+            entries = data.get(kind, []) or []
+            if not isinstance(entries, list):
+                raise ConfigError(f"{path}: write [[{kind}]] (an array of tables), not [{kind}]")
+            for entry in entries:
                 if not isinstance(entry, dict) or not entry.get("url"):
                     logger.error("Ignoring %s entry without a url in %s: %r", kind, path, entry)
                     continue
                 url = str(entry["url"]).strip()
+                where = f"{path}, {kind} {entry.get('name') or url!r}"
+                for key in entry:
+                    if key not in TOML_KEYS:
+                        logger.error("%s: unknown key %r, ignored (valid keys: %s)",
+                                     where, key, ", ".join(sorted(TOML_KEYS)))
+                expect_text = entry.get("expect") or entry.get("expect_text")
+                expect_regex = _toml_bool(entry, "expect_regex", False, where)
+                if expect_text and expect_regex:
+                    try:
+                        re.compile(str(expect_text))
+                    except re.error as exc:
+                        raise ConfigError(f"{where}: expect is not a valid regular "
+                                          f"expression: {exc}") from exc
+                headers = entry.get("headers") or {}
+                if not isinstance(headers, dict):
+                    raise ConfigError(f"{where}: headers must be a table of names and values")
+                expected = entry.get("expected_response") or {}
+                if not isinstance(expected, dict):
+                    raise ConfigError(f"{where}: expected_response must be a table")
                 targets.append(Target(
                     name=str(entry.get("name") or url),
                     url=url,
                     kind=kind,
-                    expected_status=entry.get("expected_status", 200 if kind == "api" else None),
-                    expected_response=dict(entry.get("expected_response") or {}),
-                    expect_text=entry.get("expect") or entry.get("expect_text"),
-                    expect_regex=bool(entry.get("expect_regex", False)),
+                    expected_status=_toml_int(entry, "expected_status",
+                                              200 if kind == "api" else None, where),
+                    expected_response=dict(expected),
+                    expect_text=str(expect_text) if expect_text else None,
+                    expect_regex=bool(expect_regex),
                     method=str(entry.get("method", "GET")).upper(),
-                    headers=dict(entry.get("headers") or {}),
-                    verify_ssl=bool(entry.get("verify_ssl", True)),
-                    allow_redirects=entry.get("allow_redirects"),
-                    timeout=entry.get("timeout"),
-                    check_cert=entry.get("check_cert"),
+                    headers={str(k): str(v) for k, v in headers.items()},
+                    verify_ssl=bool(_toml_bool(entry, "verify_ssl", True, where)),
+                    allow_redirects=_toml_bool(entry, "allow_redirects", None, where),
+                    timeout=_toml_seconds(entry, "timeout", where),
+                    check_cert=_toml_bool(entry, "check_cert", None, where),
                 ))
         return targets
 
     # -- validation --------------------------------------------------------
 
-    def validate(self) -> None:
+    def uses(self, channel: str) -> bool:
+        """Does any route name this channel?"""
+        return any(channel in channels for channels in self.routes.values())
+
+    def email_problem(self) -> Optional[str]:
+        """Why no email can be sent with these settings, or None when it can."""
         if not self.smtp_server:
-            raise ConfigError("SMTP server not configured (set SMTP_SERVER in .env)")
-        if not self.smtp_username or not self.smtp_password:
-            raise ConfigError(
-                "SMTP credentials not configured (set SMTP_USERNAME and SMTP_PASSWORD in .env)"
-            )
+            return "SMTP server not configured (set SMTP_SERVER in .env)"
+        if bool(self.smtp_username) != bool(self.smtp_password):
+            return ("SMTP credentials incomplete: set both SMTP_USERNAME and SMTP_PASSWORD, "
+                    "or neither for a server that takes mail without a login")
+        if not self.smtp_from:
+            return "No sender address: set SMTP_FROM (or SMTP_USERNAME, when it is an address)"
         if not self.alert_email:
-            raise ConfigError("Alert email not configured (set ALERT_EMAIL in .env)")
+            return "Alert email not configured (set ALERT_EMAIL in .env)"
         if self.smtp_security not in ("starttls", "ssl", "plain"):
-            raise ConfigError(
-                f"SMTP_SECURITY must be starttls, ssl or plain (got {self.smtp_security!r})"
-            )
-        if self.fallback_command:
-            try:
-                shlex.split(self.fallback_command)
-            except ValueError as exc:
-                raise ConfigError(f"FALLBACK_COMMAND cannot be parsed: {exc}") from exc
+            return f"SMTP_SECURITY must be starttls, ssl or plain (got {self.smtp_security!r})"
+        return None
+
+    def route_text(self) -> str:
+        """The routes in one line, for --status and the test message."""
+        return ", ".join(f"{kind.lower()} " + ("by " + " and ".join(chans) if chans else "not sent")
+                         for kind, chans in self.routes.items())
+
+    def cert_hosts(self) -> List[str]:
+        """Certificates probed, as host or host:port, in the order of the targets."""
+        if not self.ssl_check_enabled:
+            return []
+        hosts: Dict[str, None] = {}
+        for target in self.targets:
+            if target.wants_cert_check() and target.host:
+                hosts.setdefault(target.cert_key, None)
+        return list(hosts)
+
+    def validate(self, check_targets: bool = True) -> None:
+        if self.uses("email"):
+            problem = self.email_problem()
+            if problem:
+                raise ConfigError(problem)
+        if self.uses("command") and not self.message_command:
+            raise ConfigError("A ROUTE_* setting names the command channel, "
+                              "but MESSAGE_COMMAND is empty")
+        for key, command in (("FALLBACK_COMMAND", self.fallback_command),
+                             ("MESSAGE_COMMAND", self.message_command)):
+            if command:
+                try:
+                    if not shlex.split(command):
+                        raise ValueError("no program named")
+                except ValueError as exc:
+                    raise ConfigError(f"{key} cannot be parsed: {exc}") from exc
+        if not check_targets:
+            return
         if not self.targets:
             raise ConfigError(
                 f"No websites or APIs configured for monitoring (source: {self.targets_source})"
@@ -591,7 +870,9 @@ CREATE TABLE IF NOT EXISTS targets (
     open_incident_id    INTEGER,
     last_checked_at     TEXT,
     last_ok_at          TEXT,
-    last_change_at      TEXT
+    last_change_at      TEXT,
+    failing_since       TEXT,          -- first failed check of the current streak
+    flapping_since      TEXT           -- set while the target is flapping
 );
 
 -- One row per probe. This is the data behind uptime % and latency trends; the
@@ -659,7 +940,8 @@ CREATE TABLE IF NOT EXISTS notifications (
     sent_at    TEXT,
     attempts   INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
-    subject    TEXT NOT NULL
+    subject    TEXT NOT NULL,
+    channels   TEXT                               -- e.g. 'email', 'email,command', 'fallback'
 );
 CREATE INDEX IF NOT EXISTS idx_notif_created ON notifications(created_at);
 
@@ -691,6 +973,15 @@ CREATE TABLE IF NOT EXISTS meta (
 );
 """
 
+# Columns added after a table was first released. CREATE TABLE IF NOT EXISTS
+# leaves an existing table as it is, so a database from an earlier version
+# gains them here, once.
+ADDED_COLUMNS: Tuple[Tuple[str, str, str], ...] = (
+    ("targets", "failing_since", "TEXT"),
+    ("targets", "flapping_since", "TEXT"),
+    ("notifications", "channels", "TEXT"),
+)
+
 
 class Database:
     """SQLite state store.
@@ -700,7 +991,8 @@ class Database:
     simpler and safer than a pool while remaining correct under ThreadPoolExecutor.
     """
 
-    def __init__(self, path: Path = DB_PATH):
+    def __init__(self, path: Optional[Path] = None):
+        path = path or DB_PATH
         self.path = path
         path.parent.mkdir(exist_ok=True, parents=True)
         self._lock = threading.RLock()
@@ -711,11 +1003,24 @@ class Database:
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.executescript(SCHEMA)
+            self._add_missing_columns()
             self._conn.commit()
         try:
             os.chmod(path, 0o600)
         except OSError:
             pass
+
+    def _add_missing_columns(self) -> None:
+        for table, column, decl in ADDED_COLUMNS:
+            have = {row[1] for row in self._conn.execute(f"PRAGMA table_info({table})")}
+            if column in have:
+                continue
+            try:
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+            except sqlite3.OperationalError as exc:
+                # Another process (a report run at the same moment) added it first.
+                if "duplicate column" not in str(exc).lower():
+                    raise
 
     def close(self) -> None:
         with self._lock:
@@ -759,25 +1064,45 @@ class Database:
                     "INSERT INTO targets(name, url, kind, grp) VALUES(?,?,?,?) "
                     "ON CONFLICT(name) DO UPDATE SET url=excluded.url, "
                     "kind=excluded.kind, grp=excluded.grp",
-                    (target.name, target.url, target.kind, target.group),
+                    (target.name, target.url, target.kind, target.site),
                 )
             self._conn.commit()
             for row in self._conn.execute("SELECT id, name FROM targets"):
                 ids[row["name"]] = row["id"]
         return ids
 
-    def prune_targets(self, keep_names: Iterable[str]) -> int:
-        """Remove targets no longer configured (and their history, via cascade)."""
+    def prune_targets(self, keep_names: Iterable[str], grace_days: float = 0) -> int:
+        """Remove targets no longer configured, and their history by cascade, once
+        they have not been checked for `grace_days`. The grace keeps a renamed
+        target, a trial with another targets file or a mistaken edit from wiping
+        the history at once."""
         keep = set(keep_names)
+        cutoff = (now_utc() - timedelta(days=grace_days)).isoformat()
         removed = 0
         with self._lock:
-            rows = self._conn.execute("SELECT id, name FROM targets").fetchall()
+            rows = self._conn.execute(
+                "SELECT id, name, last_checked_at FROM targets").fetchall()
             for row in rows:
-                if row["name"] not in keep:
-                    self._conn.execute("DELETE FROM targets WHERE id = ?", (row["id"],))
-                    removed += 1
+                if row["name"] in keep:
+                    continue
+                if grace_days and row["last_checked_at"] and row["last_checked_at"] >= cutoff:
+                    continue
+                self._conn.execute("DELETE FROM targets WHERE id = ?", (row["id"],))
+                removed += 1
             self._conn.commit()
         return removed
+
+    def prune_certs(self, keep_hosts: Iterable[str]) -> int:
+        """Forget the certificates of hosts no longer monitored. Their rows used to
+        stay forever and appear in every summary, their days left running down."""
+        keep = set(keep_hosts)
+        with self._lock:
+            rows = self._conn.execute("SELECT host FROM certs").fetchall()
+            stale = [row["host"] for row in rows if row["host"] not in keep]
+            for host in stale:
+                self._conn.execute("DELETE FROM certs WHERE host = ?", (host,))
+            self._conn.commit()
+        return len(stale)
 
     def record_check(self, target_id: int, healthy: bool, details: Dict[str, Any],
                      run_id: Optional[int] = None) -> None:
@@ -809,8 +1134,18 @@ class Database:
                   FROM checks WHERE ts < ?
                  GROUP BY target_id, substr(ts, 1, 10)
                 ON CONFLICT(target_id, day) DO UPDATE SET
-                       checks = excluded.checks, failures = excluded.failures,
-                       avg_ms = excluded.avg_ms, max_ms = excluded.max_ms
+                       -- A day straddling the cutoff is rolled up in two passes, and
+                       -- its first part is deleted after the first: add, never replace.
+                       avg_ms = CASE
+                           WHEN daily_stats.avg_ms IS NULL THEN excluded.avg_ms
+                           WHEN excluded.avg_ms IS NULL THEN daily_stats.avg_ms
+                           ELSE (daily_stats.avg_ms * daily_stats.checks
+                                 + excluded.avg_ms * excluded.checks)
+                                / (daily_stats.checks + excluded.checks) END,
+                       max_ms = MAX(COALESCE(daily_stats.max_ms, excluded.max_ms),
+                                    COALESCE(excluded.max_ms, daily_stats.max_ms)),
+                       checks = daily_stats.checks + excluded.checks,
+                       failures = daily_stats.failures + excluded.failures
                 """,
                 (cutoff,),
             )
@@ -832,12 +1167,49 @@ class Database:
 # Checking
 # ---------------------------------------------------------------------------
 
+# A body is read up to this size, which is far more than any page needs for an
+# `expect` text or an API needs for its health fields.
+MAX_BODY_BYTES = 4 * 1024 * 1024
+
+
+def read_body(response: requests.Response, start: float, timeout: float) -> str:
+    """Read the body within `timeout` seconds of `start` and up to MAX_BODY_BYTES.
+
+    The timeout of the HTTP library applies to each read of the socket, so a
+    server trickling its answer a byte at a time used to keep a check reading
+    forever, and the lock of that run kept every later run from checking
+    anything. read1 returns what has arrived instead of waiting for a full
+    chunk, which lets the deadline be enforced between reads.
+    """
+    raw = response.raw
+    chunks: List[bytes] = []
+    size = 0
+    reader = getattr(raw, "read1", None)
+    while size < MAX_BODY_BYTES:
+        if reader is not None:
+            chunk = reader(65536, decode_content=True)
+        else:  # urllib3 1.x
+            chunk = raw.read(8192, decode_content=True)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+        if time.monotonic() - start > timeout:
+            raise Timeout(f"body not received within {timeout} seconds")
+    data = b"".join(chunks)[:MAX_BODY_BYTES]
+    return data.decode(response.encoding or "utf-8", errors="replace")
+
+
 class Checker:
     """Performs HTTP checks for both website and API targets."""
 
     def __init__(self, config: Config):
         self.config = config
         self._local = threading.local()
+        # A target with verify_ssl = false is a deliberate choice: the warning the
+        # HTTP library prints at every request would only fill cron.log.
+        if any(not t.verify_ssl for t in getattr(config, "targets", [])):
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
     def _session(self) -> requests.Session:
         session = getattr(self._local, "session", None)
@@ -861,7 +1233,8 @@ class Checker:
             try:
                 session = self._session()
                 headers = dict(target.headers) if target.headers else None
-                if target.kind == "api":
+                if target.kind == "api" and not any(
+                        k.lower() == "accept" for k in (headers or {})):
                     headers = {**(headers or {}), "Accept": "application/json"}
 
                 # stream=True so time-to-first-byte is measured without waiting
@@ -881,7 +1254,7 @@ class Checker:
                 body = ""
                 try:
                     if needs_body:
-                        body = response.text
+                        body = read_body(response, start, timeout)
                 finally:
                     total_ms = round((time.monotonic() - start) * 1000, 2)
                     response.close()
@@ -902,21 +1275,22 @@ class Checker:
                 last_details = details
 
             except SSLError as exc:
-                last_error = f"SSL error: {exc}"
+                last_error = mask_secrets(f"SSL error: {exc}")
                 last_details = None
-                logger.warning("SSL error for %s: %s", target.url, exc)
+                logger.warning("SSL error for %s: %s", mask_secrets(target.url), last_error)
             except Timeout:
                 last_error = f"Timeout after {timeout} seconds"
                 last_details = None
-                logger.warning("Timeout for %s", target.url)
+                logger.warning("Timeout for %s", mask_secrets(target.url))
             except RequestException as exc:
-                last_error = f"Request failed: {exc}"
+                last_error = mask_secrets(f"Request failed: {exc}")
                 last_details = None
-                logger.warning("Request error for %s: %s", target.url, exc)
+                logger.warning("Request error for %s: %s", mask_secrets(target.url), last_error)
             except Exception as exc:  # noqa: BLE001 - never let one target kill the run
-                last_error = f"Unexpected error: {exc}"
+                last_error = mask_secrets(f"Unexpected error: {exc}")
                 last_details = None
-                logger.error("Unexpected error for %s: %s", target.url, exc, exc_info=True)
+                logger.error("Unexpected error for %s: %s", mask_secrets(target.url), last_error,
+                             exc_info=True)
 
             if attempt < self.config.max_retries - 1:
                 time.sleep(2 ** (attempt + 1))
@@ -996,9 +1370,11 @@ def check_certificate(host: str, port: int = 443, timeout: int = 10) -> Dict[str
         if not cert:
             result["error"] = "No certificate returned"
             return result
-        not_after = datetime.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z").replace(tzinfo=UTC)
+        not_after = datetime.strptime(str(cert["notAfter"]),
+                                      "%b %d %H:%M:%S %Y %Z").replace(tzinfo=UTC)
         result["not_after"] = not_after.isoformat()
-        issuer = {k: v for part in cert.get("issuer", ()) for k, v in part}
+        fields: Any = cert.get("issuer", ())  # ((("organizationName", "X"),), ...)
+        issuer = {k: v for part in fields for k, v in part}
         result["issuer"] = issuer.get("organizationName") or issuer.get("commonName")
     except ssl.SSLCertVerificationError as exc:
         result["error"] = f"Certificate verification failed: {exc.verify_message or exc}"
@@ -1029,32 +1405,40 @@ JITTER_SLACK = 300              # must stay below half the smallest gap (3600s)
 
 
 def plan_next_notification(elapsed: float, notify_count: int,
-                           slack: int = JITTER_SLACK) -> Tuple[int, int]:
+                           slack: float = JITTER_SLACK,
+                           scale: float = 1.0) -> Tuple[int, float]:
     """Given seconds elapsed since confirmation, return (notify_count, next_offset).
 
     Offsets are absolute from the confirmation time, never "last sent + delay",
     so scheduling drift cannot accumulate over a long outage. The `slack` term is
     applied here as well as in `is_notification_due` - without it, firing three
     seconds early at one step would compress every subsequent step and slide the
-    schedule back toward hourly.
+    schedule back toward hourly. `scale` stretches the whole ladder: it is
+    ALERT_COOLDOWN / 3600, so that the first reminder comes after ALERT_COOLDOWN.
     """
     elapsed = max(0.0, elapsed)
+    offsets = [offset * scale for offset in ESCALATION_OFFSETS]
+    tail = ESCALATION_TAIL * scale
     count = 0
-    for offset in ESCALATION_OFFSETS:
+    for offset in offsets:
         if elapsed + slack >= offset:
             count += 1
         else:
             break
+    if count == len(offsets):
+        # Past the last fixed rung, count the daily rungs already behind us too,
+        # so that a monitor back from a long gap sends one reminder, not a burst.
+        count += int((elapsed + slack - offsets[-1]) // tail)
     count = max(count, notify_count + 1)
 
-    if count < len(ESCALATION_OFFSETS):
-        return count, ESCALATION_OFFSETS[count]
-    extra = count - len(ESCALATION_OFFSETS) + 1
-    return count, ESCALATION_OFFSETS[-1] + extra * ESCALATION_TAIL
+    if count < len(offsets):
+        return count, offsets[count]
+    extra = count - len(offsets) + 1
+    return count, offsets[-1] + extra * tail
 
 
 def is_notification_due(elapsed: float, next_offset: Optional[float],
-                        slack: int = JITTER_SLACK) -> bool:
+                        slack: float = JITTER_SLACK) -> bool:
     """Is a re-alert due?
 
     The `slack` is what fixes the production bug where ALERT_COOLDOWN equalled the
@@ -1067,29 +1451,18 @@ def is_notification_due(elapsed: float, next_offset: Optional[float],
     return elapsed + slack >= next_offset
 
 
-def flap_score(window: Sequence[bool], min_samples: int = 6) -> float:
-    """Weighted state-change ratio over recent checks. window[0] is most recent.
+def count_changes(window: Sequence[bool]) -> int:
+    """Changes of state between consecutive checks of a window.
 
-    A target that is simply down for 12 hours has zero transitions and so scores
-    0 - long outages are never mistaken for flapping.
+    A target that is simply down for twelve hours has none, so a long outage is
+    never mistaken for flapping.
     """
-    if len(window) < min_samples:
-        return 0.0
-    transitions = len(window) - 1
-    if transitions < 1:
-        return 0.0
-    num = den = 0.0
-    for i in range(transitions):
-        weight = 1.5 - (i / max(1, transitions - 1)) if transitions > 1 else 1.0
-        den += weight
-        if window[i] != window[i + 1]:
-            num += weight
-    return num / den if den else 0.0
+    return sum(1 for newer, older in zip(window, window[1:]) if newer != older)
 
 
 @dataclass
 class Transition:
-    """What one check did to a target's state, and what should be emailed."""
+    """What one check did to a target's state, and what should be announced."""
 
     target: Target
     healthy: bool
@@ -1099,6 +1472,21 @@ class Transition:
     started_at: Optional[datetime] = None
     duration_s: Optional[float] = None
     suppressed_by: Optional[str] = None
+    flap_event: Optional[str] = None  # None | "start" | "stop"
+    flapping: bool = False
+    flap_changes: int = 0
+    flap_failures: int = 0
+    flap_checks: int = 0
+    # What dispatch made of the messages, and what to put back when they failed.
+    delivery: Optional[str] = None
+    flap_delivery: Optional[str] = None
+    prev_notify: Optional[Tuple[int, Optional[str], Optional[str], Optional[str]]] = None
+    prev_flapping_since: Optional[str] = None
+
+
+# A message in one of these states was not delivered and is tried again at the
+# next pass. A dry run leaves the alerts to the first real run.
+RETRY_STATES = ("failed", "dry-run")
 
 
 class IncidentEngine:
@@ -1115,6 +1503,70 @@ class IncidentEngine:
         self.config = config
         self.target_ids = target_ids
 
+    def _scale(self) -> float:
+        """ALERT_COOLDOWN stretches the whole ladder; 3600 is the ladder as written."""
+        return max(self.config.alert_cooldown, 300) / 3600.0
+
+    def _slack(self) -> float:
+        # Always below half the smallest gap of the ladder, whatever its scale.
+        return min(float(JITTER_SLACK), 3600.0 * self._scale() / 4)
+
+    def settle(self, transitions: Sequence[Transition]) -> int:
+        """After dispatch, put back the alerts whose message was not delivered, so
+        that the next pass sends them again, and record the recoveries that were.
+
+        The schedule used to move on when an alert was decided, whatever became of
+        its mail: after a failed DOWN the first message was a STILL DOWN an hour
+        later, or a RESOLVED for an outage nobody had been told about. Returns the
+        number of messages left undelivered.
+        """
+        undelivered = 0
+        for t in transitions:
+            if t.kind in ("DOWN", "REALERT") and t.incident_id and t.prev_notify \
+                    and t.delivery in RETRY_STATES:
+                count, next_at, last_at, suppressed = t.prev_notify
+                self.db.execute(
+                    "UPDATE incidents SET notify_count = ?, next_notify_at = ?, "
+                    "last_notified_at = ?, suppressed_by = ? WHERE id = ? AND status = 'open'",
+                    (count, next_at, last_at, suppressed, t.incident_id))
+                undelivered += 1
+            elif t.kind == "RESOLVED" and t.incident_id:
+                if t.delivery in RETRY_STATES:
+                    undelivered += 1
+                else:
+                    self.db.execute("UPDATE incidents SET resolved_notified = 1 WHERE id = ?",
+                                    (t.incident_id,))
+            if t.flap_event and t.flap_delivery in RETRY_STATES:
+                # Undo the change of the flapping state, so that it is noticed again.
+                self.db.execute("UPDATE targets SET flapping_since = ? WHERE id = ?",
+                                (t.prev_flapping_since, self.target_ids.get(t.target.name)))
+                undelivered += 1
+        return undelivered
+
+    def pending_recoveries(self, run_ts: datetime, exclude: Iterable[Optional[int]]
+                           ) -> List[Transition]:
+        """Recoveries of announced outages whose message has not been delivered,
+        tried again at each pass for a day."""
+        skip = {i for i in exclude if i}
+        since = (run_ts - timedelta(days=1)).isoformat()
+        rows = self.db.query(
+            "SELECT i.*, t.name FROM incidents i JOIN targets t ON t.id = i.target_id "
+            "WHERE i.status = 'resolved' AND i.notify_count > 0 AND i.resolved_notified = 0 "
+            "AND i.ended_at >= ?", (since,))
+        by_name = {t.name: t for t in self.config.targets}
+        out: List[Transition] = []
+        for row in rows:
+            target = by_name.get(row["name"])
+            if target is None or row["id"] in skip:
+                continue
+            started, ended = _parse_dt(row["started_at"]), _parse_dt(row["ended_at"])
+            out.append(Transition(
+                target=target, healthy=True, kind="RESOLVED", incident_id=row["id"],
+                details={"status_code": None, "response_time_ms": None, "error": None},
+                started_at=started,
+                duration_s=(ended - started).total_seconds() if started and ended else None))
+        return out
+
     def apply(self, target: Target, healthy: bool, details: Dict[str, Any],
               run_ts: datetime, run_id: Optional[int] = None,
               cold_start: bool = False, suppress: Optional[str] = None) -> Transition:
@@ -1126,26 +1578,45 @@ class IncidentEngine:
         row = self.db.query_one("SELECT * FROM targets WHERE id = ?", (target_id,))
         prev_status = row["status"] if row else "unknown"
         open_id = row["open_incident_id"] if row else None
+        if not open_id:
+            # The incident is the truth, the pointer only a shortcut: a run killed
+            # between writing the two would otherwise leave an open incident that
+            # nothing points to, and every later pass would fail on the index
+            # allowing one open incident per target.
+            lost = self.db.query_one(
+                "SELECT id FROM incidents WHERE target_id = ? AND status = 'open'", (target_id,))
+            if lost:
+                open_id = lost["id"]
+                self.db.execute("UPDATE targets SET open_incident_id = ? WHERE id = ?",
+                                (open_id, target_id))
         cfails = (row["consecutive_failures"] if row else 0) or 0
         csucc = (row["consecutive_successes"] if row else 0) or 0
+        failing_since = row["failing_since"] if row else None
+        flapping_since = row["flapping_since"] if row else None
 
         transition = Transition(target=target, healthy=healthy, details=details)
         ts = run_ts.isoformat()
+        flapping_since = self._track_flapping(target_id, healthy, ts, flapping_since,
+                                              transition, cold_start)
 
         if healthy:
             csucc += 1
             cfails = 0
+            failing_since = None
             if open_id:
                 transition = self._resolve(target, open_id, run_ts, details, transition)
             new_status = "up"
         else:
             cfails += 1
             csucc = 0
+            if cfails == 1 or not failing_since:
+                failing_since = ts
             new_status = "down" if cfails >= self.config.failure_threshold else prev_status
             if new_status == "down":
                 transition = self._open_or_escalate(
                     target, target_id, open_id, run_ts, details, transition,
                     cold_start=cold_start, suppress=suppress,
+                    failing_since=failing_since, streak=cfails,
                 )
             else:
                 # Below the failure threshold: recorded, but not yet an incident.
@@ -1157,45 +1628,96 @@ class IncidentEngine:
             "UPDATE targets SET status = ?, consecutive_failures = ?, "
             "consecutive_successes = ?, last_checked_at = ?, "
             "last_ok_at = CASE WHEN ? THEN ? ELSE last_ok_at END, "
-            "last_change_at = CASE WHEN status != ? THEN ? ELSE last_change_at END "
+            "last_change_at = CASE WHEN status != ? THEN ? ELSE last_change_at END, "
+            "failing_since = ?, flapping_since = ? "
             "WHERE id = ?",
             (new_status, cfails, csucc, ts, 1 if healthy else 0, ts,
-             new_status, ts, target_id),
+             new_status, ts, failing_since, flapping_since, target_id),
         )
         if refreshed:
             transition.incident_id = refreshed["open_incident_id"] or transition.incident_id
         return transition
 
+    def _track_flapping(self, target_id: int, healthy: bool, ts: str,
+                        flapping_since: Optional[str], transition: Transition,
+                        cold_start: bool) -> Optional[str]:
+        """Decide from the target's last checks whether it flaps; return flapping_since.
+
+        A target starts flapping when its last FLAP_WINDOW checks hold at least
+        FLAP_CHANGES changes of state, and stops when they hold none, that is when it
+        has kept one state through the whole window. Only a stop while up is
+        announced: a target that settles down is announced by its outage alert.
+        """
+        transition.prev_flapping_since = flapping_since
+        if not self.config.flap_changes:
+            return None
+        if cold_start:
+            transition.flapping = bool(flapping_since)
+            return flapping_since
+        rows = self.db.query(
+            "SELECT healthy FROM checks WHERE target_id = ? ORDER BY id DESC LIMIT ?",
+            (target_id, self.config.flap_window))
+        window = [bool(r["healthy"]) for r in rows]
+        changes = count_changes(window)
+        transition.flap_changes = changes
+        transition.flap_failures = sum(1 for ok in window if not ok)
+        transition.flap_checks = len(window)
+        if not flapping_since and changes >= self.config.flap_changes:
+            flapping_since = ts
+            transition.flap_event = "start"
+        elif flapping_since and changes == 0 and len(window) >= self.config.flap_window:
+            flapping_since = None
+            if healthy:
+                transition.flap_event = "stop"
+        transition.flapping = bool(flapping_since)
+        return flapping_since
+
     def _open_or_escalate(self, target: Target, target_id: int, open_id: Optional[int],
                           run_ts: datetime, details: Dict[str, Any],
                           transition: Transition, cold_start: bool,
-                          suppress: Optional[str]) -> Transition:
+                          suppress: Optional[str], failing_since: Optional[str] = None,
+                          streak: int = 1) -> Transition:
         ts = run_ts.isoformat()
         error = details.get("error")
         fail_class = details.get("fail_class")
 
         if not open_id:
-            reason = suppress or ("cold_start" if cold_start else None)
-            count, next_offset = (0, 0) if reason else plan_next_notification(0.0, 0)
+            # With FAILURE_THRESHOLD above 1 the outage began at the first failed
+            # check of the streak, not at the check that confirmed it.
+            started = min(_parse_dt(failing_since) or run_ts, run_ts)
+            hold = transition.flapping and self.config.flap_hold > 0
+            reason = suppress or ("cold_start" if cold_start else None) or ("flap" if hold else None)
+            next_at: Optional[datetime] = None
+            count = 0
+            if reason == "flap":
+                # An outage of a flapping target is announced once it has lasted.
+                next_at = run_ts + timedelta(seconds=self.config.flap_hold)
+            elif not reason:
+                count, offset = plan_next_notification(0.0, 0, slack=self._slack(),
+                                                       scale=self._scale())
+                next_at = run_ts + timedelta(seconds=offset)
             cur = self.db.execute(
                 "INSERT INTO incidents(target_id, grp, status, started_at, confirmed_at, "
                 "fail_class, first_error, last_error, status_code, checks_failed, "
                 "notify_count, last_notified_at, next_notify_at, suppressed_by) "
-                "VALUES(?,?,'open',?,?,?,?,?,?,1,?,?,?,?)",
-                (target_id, target.group, ts, ts, fail_class, error, error,
-                 details.get("status_code"), count,
+                "VALUES(?,?,'open',?,?,?,?,?,?,?,?,?,?,?)",
+                (target_id, target.site, started.isoformat(), ts, fail_class, error, error,
+                 details.get("status_code"), max(1, streak), count,
                  ts if count else None,
-                 (run_ts + timedelta(seconds=next_offset)).isoformat() if count else None,
+                 next_at.isoformat() if next_at else None,
                  reason),
             )
             incident_id = cur.lastrowid
             self.db.execute("UPDATE targets SET open_incident_id = ? WHERE id = ?",
                             (incident_id, target_id))
             transition.incident_id = incident_id
-            transition.started_at = run_ts
+            transition.started_at = started
             transition.suppressed_by = reason
             if not reason:
                 transition.kind = "DOWN"
+                transition.prev_notify = (0, None, None, None)
+                if started < run_ts:
+                    transition.duration_s = (run_ts - started).total_seconds()
             return transition
 
         inc = self.db.query_one("SELECT * FROM incidents WHERE id = ?", (open_id,))
@@ -1216,12 +1738,19 @@ class IncidentEngine:
         transition.incident_id = open_id
         transition.started_at = _parse_dt(inc["started_at"])
 
-        if inc["suppressed_by"] in ("mute", "flap"):
-            transition.suppressed_by = inc["suppressed_by"]
-            return transition
+        if inc["suppressed_by"] == "flap" and not (inc["notify_count"] or 0):
+            # Held while the target flaps; announced once the outage has lasted
+            # FLAP_HOLD, so that flapping can never silence a lasting outage.
+            hold_s = next_offset if next_offset is not None else float(self.config.flap_hold)
+            if elapsed + min(JITTER_SLACK, 60) < hold_s:
+                transition.suppressed_by = "flap"
+                return transition
 
-        if is_notification_due(elapsed, next_offset):
-            count, offset = plan_next_notification(elapsed, inc["notify_count"] or 0)
+        if is_notification_due(elapsed, next_offset, slack=self._slack()):
+            transition.prev_notify = (inc["notify_count"] or 0, inc["next_notify_at"],
+                                      inc["last_notified_at"], inc["suppressed_by"])
+            count, offset = plan_next_notification(elapsed, inc["notify_count"] or 0,
+                                                   slack=self._slack(), scale=self._scale())
             self.db.execute(
                 "UPDATE incidents SET notify_count = ?, last_notified_at = ?, "
                 "next_notify_at = ?, suppressed_by = NULL WHERE id = ?",
@@ -1248,19 +1777,24 @@ class IncidentEngine:
         transition.incident_id = open_id
         transition.started_at = started
         transition.duration_s = (run_ts - started).total_seconds()
-        # Never announce the resolution of a problem the operator was never told about.
+        # Never announce the resolution of a problem the operator was never told
+        # about. Whether the announcement was delivered is recorded by settle().
         if (inc["notify_count"] or 0) > 0:
             transition.kind = "RESOLVED"
-            self.db.execute("UPDATE incidents SET resolved_notified = 1 WHERE id = ?", (open_id,))
         else:
             transition.suppressed_by = inc["suppressed_by"] or "never_alerted"
         return transition
 
     # -- legacy migration --------------------------------------------------
 
-    def migrate_legacy_history(self, path: Path = LEGACY_HISTORY,
+    def migrate_legacy_history(self, path: Optional[Path] = None,
                                local_tz: Optional[str] = None) -> Dict[str, int]:
-        """Import alert_history.json once, preserving cooldown state for live outages.
+        """Retire alert_history.json of version 1, once.
+
+        The file is kept verbatim in the meta table and renamed. No cooldown is
+        carried forward: the escalation clock now lives on each incident, and a
+        stale cooldown on a healthy target was precisely the swallowed-outage
+        bug; the entries are only counted, for the log.
 
         Timestamps without a timezone were written by an older build using
         `datetime.now()`, i.e. the host's LOCAL time (verified against the log
@@ -1269,6 +1803,7 @@ class IncidentEngine:
         and over-suppressing. They are converted from the local zone here.
         """
         report = {"imported": 0, "skipped_up": 0, "dropped_stale": 0, "tz_fixed": 0}
+        path = path or LOG_DIR / "alert_history.json"
         if self.db.get_meta("legacy_import_at") or not path.exists():
             return report
         try:
@@ -1327,12 +1862,14 @@ class IncidentEngine:
 # ---------------------------------------------------------------------------
 
 def _smtp_connect(host: str, port: int, security: str,
-                  timeout: Optional[int]) -> smtplib.SMTP:
-    """Open an SMTP connection: implicit TLS ("ssl"), none ("plain"), else STARTTLS."""
+                  timeout: Optional[float]) -> smtplib.SMTP:
+    """Open an SMTP connection: implicit TLS ("ssl"), none ("plain"), else STARTTLS.
+    A timeout of None waits as long as the server takes."""
+    wait: Any = timeout  # smtplib's own default is "no timeout", which None stands for
     if security == "ssl":
-        return smtplib.SMTP_SSL(host, port, timeout=timeout,
+        return smtplib.SMTP_SSL(host, port, timeout=wait,
                                 context=ssl.create_default_context())
-    server = smtplib.SMTP(host, port, timeout=timeout)
+    server = smtplib.SMTP(host, port, timeout=wait)
     if security != "plain":
         server.starttls(context=ssl.create_default_context())
     return server
@@ -1347,46 +1884,66 @@ def _sender_domain(address: Optional[str]) -> str:
 
 
 # Kinds of message the spare route may carry. A test message is left out on
-# purpose, so that a broken mail setting is reported as broken, and so is the
-# daily summary, which is not worth waking anyone for.
-FALLBACK_KINDS = ("DOWN", "RESOLVED", "SSL", "NOTIFY")
-FALLBACK_TIMEOUT_S = 30
-FALLBACK_MAX_BODY = 8000
+# purpose, so that a broken channel is reported as broken, and so is the daily
+# summary, which is not worth waking anyone for.
+FALLBACK_KINDS = ("DOWN", "RESOLVED", "TLS", "FLAP", "STEADY", "NOTIFY")
+COMMAND_TIMEOUT_S = 30
+COMMAND_MAX_BODY = 8000
+_PLACEHOLDER_RE = re.compile(r"\{(subject|kind|level)\}")
+
+# What a delivery came to, as Notifier.deliver reports it.
+DELIVERED_STATES = ("sent", "fallback")
+HARMLESS_STATES = ("sent", "fallback", "skipped", "duplicate", "dry-run")
 
 
-def run_fallback(command: str, subject: str, body: str) -> bool:
-    """Deliver a message by the spare route when the mail server cannot take it.
+def run_command(command: str, subject: str, body: str, kind: str = "NOTIFY",
+                label: str = "Message command") -> Tuple[bool, Optional[str]]:
+    """Hand a message to a command of one's own. Returns (delivered, error).
 
-    The command line is split like a shell would, but no shell is involved. The
-    text ``{subject}`` in an argument is replaced by the subject, and the body is
-    written to the standard input. Returns True if the command exits with status 0.
+    The command line is split like a shell would, but no shell is involved. In
+    each argument, ``{subject}`` becomes the subject, ``{kind}`` the kind of the
+    message (down, resolved, tls, flap, steady, summary, notify, test, broken)
+    and ``{level}`` its weight in the words of chat notifiers (error, warn,
+    success, info), all in one pass, so that a subject containing such a word
+    is never rewritten. The body is written to the standard input. The message
+    counts as delivered when the command exits with status 0.
     """
     if not command:
-        return False
+        return False, "no command configured"
+    values = {"subject": subject, "kind": kind.lower(),
+              "level": MESSAGE_LEVELS.get(kind, "info")}
     try:
-        argv = [part.replace("{subject}", subject) for part in shlex.split(command)]
+        argv = [_PLACEHOLDER_RE.sub(lambda m: values[m.group(1)], part)
+                for part in shlex.split(command)]
     except ValueError as exc:
-        logger.error("FALLBACK_COMMAND cannot be parsed: %s", exc)
-        return False
+        logger.error("%s cannot be parsed: %s", label, exc)
+        return False, f"cannot be parsed: {exc}"
     if not argv:
-        return False
+        return False, "empty command"
     try:
-        done = subprocess.run(argv, input=body[:FALLBACK_MAX_BODY], text=True,
-                              capture_output=True, timeout=FALLBACK_TIMEOUT_S,
+        done = subprocess.run(argv, input=body[:COMMAND_MAX_BODY], text=True,
+                              capture_output=True, timeout=COMMAND_TIMEOUT_S,
                               check=False)
     except (OSError, subprocess.SubprocessError) as exc:
-        logger.error("Spare route failed to run: %s", exc)
-        return False
+        logger.error("%s failed to run: %s", label, exc)
+        return False, f"failed to run: {exc}"
     if done.returncode != 0:
-        logger.error("Spare route exited with status %d: %s", done.returncode,
-                     (done.stderr or "").strip()[-200:])
-        return False
-    logger.warning("Delivered by the spare route: %s", subject)
-    return True
+        tail = (done.stderr or "").strip()[-200:]
+        logger.error("%s exited with status %d: %s", label, done.returncode, tail)
+        return False, f"exit status {done.returncode}"
+    return True, None
 
 
-class EmailNotifier:
-    """Builds and sends coalesced alert email."""
+def run_fallback(command: str, subject: str, body: str, kind: str = "NOTIFY") -> bool:
+    """Deliver a message by the spare route when its channels could not."""
+    ok, _ = run_command(command, subject, body, kind, label="Spare route")
+    if ok:
+        logger.warning("Delivered by the spare route: %s", subject)
+    return ok
+
+
+class Notifier:
+    """Builds coalesced alerts and delivers each message by the channels of its route."""
 
     def __init__(self, config: Config, db: Optional[Database] = None, dry_run: bool = False):
         self.config = config
@@ -1400,34 +1957,93 @@ class EmailNotifier:
                              self.config.smtp_security, self.config.smtp_timeout or None)
 
     def send(self, subject: str, body: str, html: Optional[str] = None,
-             dedup_key: Optional[str] = None, kind: str = "ALERT") -> bool:
-        """Send one email. Returns True if the message was delivered, by the SMTP
-        server or, for the kinds in FALLBACK_KINDS, by the spare route."""
+             dedup_key: Optional[str] = None, kind: str = "NOTIFY",
+             channels: Optional[Sequence[str]] = None) -> bool:
+        """Deliver one message. True if a channel of its route, or for the kinds in
+        FALLBACK_KINDS the spare route, delivered it."""
+        return self.deliver(subject, body, html, dedup_key, kind, channels) in DELIVERED_STATES
+
+    def deliver(self, subject: str, body: str, html: Optional[str] = None,
+                dedup_key: Optional[str] = None, kind: str = "NOTIFY",
+                channels: Optional[Sequence[str]] = None) -> str:
+        """Deliver one message by the channels of its route (or those given).
+
+        Returns 'sent', 'fallback' (the spare route carried it), 'failed',
+        'skipped' (the route is none), 'duplicate' (already delivered under this
+        dedup_key) or 'dry-run'.
+        """
+        route = ROUTE_OF.get(kind, kind)
+        chosen = list(channels) if channels is not None else self.config.routes.get(
+            route, ["email"])
+        if not chosen:
+            logger.info("Not sent, ROUTE_%s is none: %s", route, subject)
+            return "skipped"
         if self.dry_run:
-            logger.warning("[dry-run] would send: %s", subject)
+            logger.warning("[dry-run] would send by %s: %s", " and ".join(chosen), subject)
             logger.debug("[dry-run] body:\n%s", body)
-            return False
+            return "dry-run"
 
         if dedup_key and self.db is not None:
             existing = self.db.query_one(
                 "SELECT state FROM notifications WHERE dedup_key = ?", (dedup_key,))
-            if existing and existing["state"] in ("sent", "fallback"):
+            if existing and existing["state"] in DELIVERED_STATES:
                 logger.debug("Notification %s already sent, skipping", dedup_key)
-                return False
+                return "duplicate"
             self.db.execute(
                 "INSERT INTO notifications(kind, dedup_key, state, created_at, subject) "
                 "VALUES(?,?,'pending',?,?) ON CONFLICT(dedup_key) DO NOTHING",
                 (kind, dedup_key, now_utc().isoformat(), subject),
             )
 
+        delivered: List[str] = []
+        errors: List[str] = []
+        for channel in chosen:
+            if channel == "email":
+                ok, error = self._send_email(subject, body, html, dedup_key)
+            else:
+                ok, error = run_command(self.config.message_command, subject, body, kind)
+                if ok:
+                    logger.info("Sent by command: %s", subject)
+            if ok:
+                delivered.append(channel)
+            else:
+                errors.append(f"{channel}: {error}")
+
+        state = "sent" if delivered else "failed"
+        if not delivered:
+            logger.error("Failed to send %r: %s", subject, "; ".join(errors))
+            spare = self.config.fallback_command
+            # The spare route is pointless when it is the command that just failed.
+            same = "command" in chosen and spare == self.config.message_command
+            if kind in FALLBACK_KINDS and spare and not same and \
+                    run_fallback(spare, subject, body, kind):
+                delivered.append("fallback")
+                state = "fallback"
+
+        if dedup_key and self.db is not None:
+            self.db.execute(
+                "UPDATE notifications SET state=?, sent_at=?, attempts=attempts+1, "
+                "last_error=?, channels=? WHERE dedup_key = ?",
+                (state, now_utc().isoformat() if delivered else None,
+                 "; ".join(errors) or None, ",".join(delivered) or None, dedup_key))
+        return state
+
+    def _send_email(self, subject: str, body: str, html: Optional[str],
+                    dedup_key: Optional[str] = None) -> Tuple[bool, Optional[str]]:
+        problem = self.config.email_problem()
+        if problem:
+            return False, problem
         msg = MIMEMultipart("alternative")
-        msg["From"] = self.config.smtp_username or ""
+        msg["From"] = self.config.smtp_from
         msg["To"] = ", ".join(self.config.alert_email)
         msg["Subject"] = subject
         msg["Date"] = formatdate(localtime=True)
-        # A stable Message-ID lets the mail client thread/collapse a duplicate if
-        # we crash between a successful send and recording that it was sent.
-        msg["Message-ID"] = make_msgid(domain=_sender_domain(self.config.smtp_username))
+        # A Message-ID derived from the dedup key lets the mail client collapse a
+        # duplicate if we crash between a successful send and recording it.
+        domain = _sender_domain(self.config.smtp_from)
+        msg["Message-ID"] = (
+            f"<{hashlib.sha256(dedup_key.encode()).hexdigest()[:32]}@{domain}>"
+            if dedup_key else make_msgid(domain=domain))
         msg["Auto-Submitted"] = "auto-generated"
         msg.attach(MIMEText(body, "plain", "utf-8"))
         if html:
@@ -1437,16 +2053,12 @@ class EmailNotifier:
         for attempt in range(2):
             try:
                 with closing(self._connect()) as server:
-                    server.login(self.config.smtp_username, self.config.smtp_password)
+                    # A local relay may take mail without a login.
+                    if self.config.smtp_username:
+                        server.login(self.config.smtp_username, self.config.smtp_password or "")
                     server.send_message(msg)
-                if dedup_key and self.db is not None:
-                    self.db.execute(
-                        "UPDATE notifications SET state='sent', sent_at=?, "
-                        "attempts=attempts+1 WHERE dedup_key = ?",
-                        (now_utc().isoformat(), dedup_key),
-                    )
                 logger.info("Sent: %s", subject)
-                return True
+                return True, None
             except smtplib.SMTPAuthenticationError as exc:
                 # A wrong password stays wrong, and the mail server bans an
                 # address after a few refused logins: never try twice.
@@ -1458,34 +2070,42 @@ class EmailNotifier:
                 logger.warning("SMTP attempt %d failed: %s", attempt + 1, exc)
                 if attempt == 0:
                     time.sleep(5)
-
-        logger.error("Failed to send %r: %s", subject, last_error)
-        delivered = (kind in FALLBACK_KINDS and
-                     run_fallback(self.config.fallback_command, subject, body))
-        if dedup_key and self.db is not None:
-            self.db.execute(
-                "UPDATE notifications SET state=?, sent_at=?, attempts=attempts+1, "
-                "last_error=? WHERE dedup_key = ?",
-                ("fallback" if delivered else "failed",
-                 now_utc().isoformat() if delivered else None,
-                 last_error, dedup_key))
-        return delivered
+        return False, last_error
 
     # -- composition -------------------------------------------------------
 
     def dispatch(self, transitions: Sequence[Transition], run_ts: datetime,
-                 banner: Optional[str] = None) -> int:
-        """Group transitions into as few emails as possible and send them."""
+                 banner: Optional[str] = None, suspect_self: bool = False) -> int:
+        """Group transitions into as few messages as possible and send them.
+
+        Each transition keeps in `delivery` (and `flap_delivery`) what became of
+        its message, for IncidentEngine.settle(). Returns the number delivered.
+        """
         downs = [t for t in transitions if t.kind in ("DOWN", "REALERT")]
         ups = [t for t in transitions if t.kind == "RESOLVED"]
+        flaps = [t for t in transitions if t.flap_event == "start"]
+        steadies = [t for t in transitions if t.flap_event == "stop"]
         sent = 0
 
+        def note(items: Sequence[Transition], state: str, attr: str = "delivery") -> None:
+            nonlocal sent
+            sent += 1 if state in DELIVERED_STATES else 0
+            for t in items:
+                setattr(t, attr, state)
+
         if downs:
-            for subject, body, html, key in self._compose_down(downs, run_ts, banner):
-                sent += 1 if self.send(subject, body, html, key, "DOWN") else 0
+            for chunk, (subject, body, html, key) in self._compose_down_chunks(
+                    downs, run_ts, banner, suspect_self):
+                note(chunk, self.deliver(subject, body, html, key, "DOWN"))
         if ups:
             for subject, body, html, key in self._compose_resolved(ups, run_ts):
-                sent += 1 if self.send(subject, body, html, key, "RESOLVED") else 0
+                note(ups, self.deliver(subject, body, html, key, "RESOLVED"))
+        if flaps:
+            subject, body, html, key = self._compose_flap(flaps, run_ts, banner)
+            note(flaps, self.deliver(subject, body, html, key, "FLAP"), "flap_delivery")
+        if steadies:
+            subject, body, html, key = self._compose_steady(steadies, run_ts)
+            note(steadies, self.deliver(subject, body, html, key, "STEADY"), "flap_delivery")
         return sent
 
     def _groups(self, transitions: Sequence[Transition]) -> List[List[Transition]]:
@@ -1493,8 +2113,18 @@ class EmailNotifier:
             return [[t] for t in transitions]
         buckets: Dict[str, List[Transition]] = {}
         for t in transitions:
-            buckets.setdefault(t.target.group, []).append(t)
+            buckets.setdefault(t.target.site, []).append(t)
         return [buckets[k] for k in sorted(buckets)]
+
+    @staticmethod
+    def _sites_subject(tag: str, items: Sequence[Transition], one: str, many: str) -> str:
+        """'[DOWN] photo.example.com: 2 targets failing', or for several sites
+        '[DOWN] 3 sites, 4 targets failing: a.org, b.org, c.org'."""
+        sites = sorted({t.target.site for t in items})
+        if len(sites) == 1:
+            return f"[{tag}] {sites[0]}: {one}"
+        names = ", ".join(sites[:3]) + ("…" if len(sites) > 3 else "")
+        return f"[{tag}] {len(sites)} sites, {many}: {names}"
 
     @staticmethod
     def _stamp(run_ts: datetime) -> str:
@@ -1503,39 +2133,44 @@ class EmailNotifier:
                 f"({local.strftime('%H:%M %Z')})")
 
     def _compose_down(self, downs: Sequence[Transition], run_ts: datetime,
-                      banner: Optional[str]) -> List[Tuple[str, str, str, str]]:
+                      banner: Optional[str],
+                      suspect_self: bool = False) -> List[Tuple[str, str, str, str]]:
+        return [message for _, message in
+                self._compose_down_chunks(downs, run_ts, banner, suspect_self)]
+
+    def _compose_down_chunks(self, downs: Sequence[Transition], run_ts: datetime,
+                             banner: Optional[str], suspect_self: bool = False
+                             ) -> List[Tuple[List[Transition], Tuple[str, str, str, str]]]:
         out = []
-        # One email per run covering every affected domain: the apex/www twins that
-        # used to generate two near-identical alerts now appear as two lines in one.
+        # One message per run covering every affected site (GROUP_ALERTS=true), or
+        # one per target; within a message the targets are listed site by site.
         groups = self._groups(downs)
         all_in_one = self.config.group_alerts
         chunks = [downs] if all_in_one else groups
 
         for chunk in chunks:
             chunk = list(chunk)
-            domains = sorted({t.target.group for t in chunk})
+            sites = sorted({t.target.site for t in chunk})
             realert = all(t.kind == "REALERT" for t in chunk)
             tag = "STILL DOWN" if realert else "DOWN"
-            if len(domains) == 1:
-                subject = f"[{tag}] {domains[0]} — {len(chunk)} target(s) failing"
-            else:
-                subject = (f"[{tag}] {len(domains)} domains / {len(chunk)} targets — "
-                           + ", ".join(domains[:3])
-                           + ("…" if len(domains) > 3 else ""))
+            failing = f"{plural(len(chunk), 'target')} failing"
+            if suspect_self:
+                failing += ", the monitoring host suspected"
+            subject = self._sites_subject(tag, chunk, failing, failing)
 
             lines = [f"{'Website/API Monitoring Alert':^68}", "=" * 68, ""]
             if banner:
                 lines += [f"!! {banner}", ""]
             lines += [f"Time: {self._stamp(run_ts)}", ""]
-            for domain in domains:
-                members = [t for t in chunk if t.target.group == domain]
-                lines.append(f"── {domain} " + "─" * max(0, 64 - len(domain)))
+            for site in sites:
+                members = [t for t in chunk if t.target.site == site]
+                lines.append(f"── {site} " + "─" * max(0, 64 - len(site)))
                 for t in members:
                     d = t.details
                     down_for = (f", down for {human_duration(t.duration_s)}"
-                                if t.duration_s else "")
-                    lines.append(f"  ✗ {t.target.name}{down_for}")
-                    lines.append(f"      URL:    {t.target.url}")
+                                if t.duration_s and t.duration_s >= 60 else "")
+                    lines.append(f"  ✗ {mask_secrets(t.target.name)}{down_for}")
+                    lines.append(f"      URL:    {mask_secrets(t.target.url)}")
                     lines.append(f"      Error:  {d.get('error', 'Unknown')}")
                     lines.append(f"      Status: {d.get('status_code', 'N/A')}"
                                  f"   Class: {d.get('fail_class', 'unknown')}")
@@ -1543,10 +2178,13 @@ class EmailNotifier:
                         lines.append(f"      Time:   {d['response_time_ms']} ms")
                     if t.target.kind == "api" and d.get("response_data") is not None:
                         lines.append("      Body:   " + redact(d["response_data"]).replace("\n", "\n              "))
+                    if t.flapping:
+                        lines.append(f"      Note:   flapping, {t.flap_changes} changes of state "
+                                     f"in its last {t.flap_checks} checks")
                 lines.append("")
             classes = sorted({t.details.get("fail_class") or "unknown" for t in chunk})
             if len(classes) > 1:
-                lines += [f"Note: mixed failure types in this alert ({', '.join(classes)}) — "
+                lines += [f"Note: mixed failure types in this alert ({', '.join(classes)}); "
                           "these may be unrelated problems.", ""]
             lines += [
                 "Suggested checks:",
@@ -1560,30 +2198,26 @@ class EmailNotifier:
             body = "\n".join(lines)
             key = f"DOWN:{run_ts.isoformat()}:" + ",".join(
                 sorted(str(t.incident_id) for t in chunk))
-            out.append((subject, body, self._html_down(chunk, run_ts, banner), key))
+            out.append((chunk, (subject, body, self._html_down(chunk, run_ts, banner), key)))
         return out
 
     def _compose_resolved(self, ups: Sequence[Transition],
                           run_ts: datetime) -> List[Tuple[str, str, str, str]]:
-        domains = sorted({t.target.group for t in ups})
-        longest = max((t.duration_s or 0) for t in ups)
-        if len(domains) == 1:
-            subject = (f"[RESOLVED] {domains[0]} — back up after "
-                       f"{human_duration(longest)}")
-        else:
-            subject = (f"[RESOLVED] {len(domains)} domains / {len(ups)} targets — "
-                       f"back up after {human_duration(longest)}")
+        sites = sorted({t.target.site for t in ups})
+        longest = human_duration(max((t.duration_s or 0) for t in ups))
+        subject = self._sites_subject("RESOLVED", ups, f"back up after {longest}",
+                                      f"{plural(len(ups), 'target')} back up after {longest}")
 
         lines = [f"{'Service Restored':^68}", "=" * 68, "",
                  f"Time: {self._stamp(run_ts)}", ""]
-        for domain in domains:
-            members = [t for t in ups if t.target.group == domain]
-            lines.append(f"── {domain} " + "─" * max(0, 64 - len(domain)))
+        for site in sites:
+            members = [t for t in ups if t.target.site == site]
+            lines.append(f"── {site} " + "─" * max(0, 64 - len(site)))
             for t in members:
-                lines.append(f"  ✓ {t.target.name}")
-                lines.append(f"      URL:      {t.target.url}")
+                lines.append(f"  ✓ {mask_secrets(t.target.name)}")
+                lines.append(f"      URL:      {mask_secrets(t.target.url)}")
                 if t.started_at:
-                    lines.append(f"      Down at:  {t.started_at.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+                    lines.append(f"      Down at:  {self._stamp(t.started_at)}")
                 lines.append(f"      Duration: {human_duration(t.duration_s or 0)}")
                 if t.details.get("response_time_ms") is not None:
                     lines.append(f"      Now:      HTTP {t.details.get('status_code')} "
@@ -1594,6 +2228,64 @@ class EmailNotifier:
         key = f"RESOLVED:{run_ts.isoformat()}:" + ",".join(
             sorted(str(t.incident_id) for t in ups))
         return [(subject, body, self._html_resolved(ups, run_ts), key)]
+
+    def _flap_lines(self, items: Sequence[Transition], mark: str) -> List[str]:
+        lines: List[str] = []
+        for site in sorted({t.target.site for t in items}):
+            lines.append(f"── {site} " + "─" * max(0, 64 - len(site)))
+            for t in (x for x in items if x.target.site == site):
+                state = "up now" if t.healthy else (
+                    f"down now ({t.details.get('error') or 'unknown error'})")
+                lines.append(f"  {mark} {mask_secrets(t.target.name)}: "
+                             f"{plural(t.flap_changes, 'change')} of "
+                             f"state and {plural(t.flap_failures, 'failed check')} in its last "
+                             f"{plural(t.flap_checks, 'check')}, {state}")
+            lines.append("")
+        return lines
+
+    def _compose_flap(self, flaps: Sequence[Transition], run_ts: datetime,
+                      banner: Optional[str]) -> Tuple[str, str, str, str]:
+        """One notice when targets start flapping, in place of an alert per change."""
+        window = self.config.flap_window
+        subject = self._sites_subject(
+            "FLAPPING", flaps,
+            f"{plural(len(flaps), 'target')} changing state over and over",
+            f"{plural(len(flaps), 'target')} changing state over and over")
+        hold = human_duration(self.config.flap_hold)
+        lines = [f"{'Flapping Detected':^68}", "=" * 68, ""]
+        if banner:
+            lines += [f"!! {banner}", ""]
+        lines += [f"Time: {self._stamp(run_ts)}", ""]
+        lines += self._flap_lines(flaps, "~")
+        if self.config.flap_hold:
+            lines += ["While a target flaps, an outage of it is announced only once it has",
+                      f"lasted {hold}, and its recovery only if the outage was announced."]
+        lines += [f"A message follows when it has kept one state through {window} checks",
+                  "in a row. Intermittent failures often come from an overloaded server,",
+                  "a failing backend behind a load balancer, or rate limiting of the",
+                  "monitor's requests.", "", f"-- Website Monitor v{__version__}"]
+        key = f"FLAP:{run_ts.isoformat()}:" + ",".join(sorted(t.target.name for t in flaps))
+        rows = self._html_flap_rows(flaps, "#f0932b", "#fff8ee")
+        html = self._shell("Flapping Detected", "#f0932b", rows,
+                           f"Website Monitor v{__version__}")
+        return subject, "\n".join(lines), html, key
+
+    def _compose_steady(self, steadies: Sequence[Transition],
+                        run_ts: datetime) -> Tuple[str, str, str, str]:
+        """One notice when flapping targets have held steady (up) through a window."""
+        window = self.config.flap_window
+        subject = self._sites_subject(
+            "STEADY", steadies, f"up through its last {window} checks",
+            f"{plural(len(steadies), 'target')} up through their last {window} checks")
+        lines = [f"{'Flapping Over':^68}", "=" * 68, "",
+                 f"Time: {self._stamp(run_ts)}", ""]
+        lines += self._flap_lines(steadies, "✓")
+        lines += ["Outages and recoveries of these targets are announced as usual again.",
+                  "", f"-- Website Monitor v{__version__}"]
+        key = f"STEADY:{run_ts.isoformat()}:" + ",".join(sorted(t.target.name for t in steadies))
+        rows = self._html_flap_rows(steadies, "#2f9e44", "#f2fbf4")
+        html = self._shell("Flapping Over", "#2f9e44", rows, f"Website Monitor v{__version__}")
+        return subject, "\n".join(lines), html, key
 
     # -- HTML --------------------------------------------------------------
 
@@ -1614,38 +2306,60 @@ font-size:12px;color:#7b8794">{footer}</td></tr></table></body></html>"""
         rows = []
         if banner:
             rows.append(f'<p style="margin:0 0 14px;padding:10px 12px;background:#fff4e5;'
-                        f'border-left:3px solid #f0932b;font-size:13px">{banner}</p>')
+                        f'border-left:3px solid #f0932b;font-size:13px">{_esc(banner)}</p>')
         rows.append(f'<p style="margin:0 0 16px;font-size:13px;color:#52606d">'
-                    f'{self._stamp(run_ts)}</p>')
-        for domain in sorted({t.target.group for t in chunk}):
-            rows.append(f'<p style="margin:16px 0 6px;font-weight:600;font-size:14px">{domain}</p>')
-            for t in (x for x in chunk if x.target.group == domain):
+                    f'{_esc(self._stamp(run_ts))}</p>')
+        for site in sorted({t.target.site for t in chunk}):
+            rows.append(f'<p style="margin:16px 0 6px;font-weight:600;font-size:14px">'
+                        f'{_esc(site)}</p>')
+            for t in (x for x in chunk if x.target.site == site):
                 d = t.details
                 dur = (f' · down {human_duration(t.duration_s)}' if t.duration_s else '')
                 rows.append(
                     f'<table role="presentation" width="100%" style="margin:0 0 8px;'
                     f'border-left:3px solid #d64545;background:#fdf3f3"><tr><td style="padding:10px 12px">'
-                    f'<div style="font-weight:600;font-size:13px">{t.target.name}{dur}</div>'
+                    f'<div style="font-weight:600;font-size:13px">{_esc(mask_secrets(t.target.name))}{dur}</div>'
                     f'<div style="font-size:12px;color:#52606d;margin-top:3px">'
-                    f'{d.get("error", "Unknown error")}</div>'
+                    f'{_esc(str(d.get("error") or "Unknown error"))}</div>'
                     f'<div style="font-size:11px;color:#7b8794;margin-top:4px">'
-                    f'HTTP {d.get("status_code", "N/A")} · {d.get("fail_class", "unknown")}'
+                    f'HTTP {_esc(str(d.get("status_code") or "N/A"))} · '
+                    f'{_esc(str(d.get("fail_class") or "unknown"))}'
                     f'</div></td></tr></table>')
         return self._shell("Monitoring Alert", "#d64545", "".join(rows),
                            f"Website Monitor v{__version__}")
 
     def _html_resolved(self, ups: Sequence[Transition], run_ts: datetime) -> str:
         rows = [f'<p style="margin:0 0 16px;font-size:13px;color:#52606d">'
-                f'{self._stamp(run_ts)}</p>']
+                f'{_esc(self._stamp(run_ts))}</p>']
         for t in ups:
             rows.append(
                 f'<table role="presentation" width="100%" style="margin:0 0 8px;'
                 f'border-left:3px solid #2f9e44;background:#f2fbf4"><tr><td style="padding:10px 12px">'
-                f'<div style="font-weight:600;font-size:13px">{t.target.name}</div>'
+                f'<div style="font-weight:600;font-size:13px">{_esc(mask_secrets(t.target.name))}</div>'
                 f'<div style="font-size:12px;color:#52606d;margin-top:3px">'
                 f'Recovered after {human_duration(t.duration_s or 0)}</div></td></tr></table>')
         return self._shell("Service Restored", "#2f9e44", "".join(rows),
                            f"Website Monitor v{__version__}")
+
+    @staticmethod
+    def _html_flap_rows(items: Sequence[Transition], accent: str, background: str) -> str:
+        rows = []
+        for t in items:
+            state = "up now" if t.healthy else "down now"
+            rows.append(
+                f'<table role="presentation" width="100%" style="margin:0 0 8px;'
+                f'border-left:3px solid {accent};background:{background}"><tr>'
+                f'<td style="padding:10px 12px">'
+                f'<div style="font-weight:600;font-size:13px">{_esc(mask_secrets(t.target.name))}</div>'
+                f'<div style="font-size:12px;color:#52606d;margin-top:3px">'
+                f'{plural(t.flap_changes, "change")} of state and '
+                f'{plural(t.flap_failures, "failed check")} in its last '
+                f'{plural(t.flap_checks, "check")}, {state}</div></td></tr></table>')
+        return "".join(rows)
+
+
+# The name of the class before messages could leave by a command as well.
+EmailNotifier = Notifier
 
 
 # ---------------------------------------------------------------------------
@@ -1656,9 +2370,9 @@ class SingleInstanceLock:
     """Prevents overlapping runs. Without it, two cron runs both see the same
     open incident, both find it due, and both email."""
 
-    def __init__(self, path: Path = LOCK_PATH):
-        self.path = path
-        self._fh = None
+    def __init__(self, path: Optional[Path] = None):
+        self.path = path or LOCK_PATH
+        self._fh: Optional[Any] = None
 
     def __enter__(self) -> "SingleInstanceLock":
         self.path.parent.mkdir(exist_ok=True, parents=True)
@@ -1681,23 +2395,34 @@ class SingleInstanceLock:
                 self._fh.close()
 
 
+# Days a target absent from the configuration keeps its history before pruning.
+TARGET_GRACE_DAYS = 7
+
+
 class WebsiteMonitor:
     """Main monitoring orchestrator."""
 
     def __init__(self, config: Optional[Config] = None, dry_run: bool = False,
-                 db_path: Path = DB_PATH):
+                 db_path: Optional[Path] = None):
         self.config = config or Config()
         self.dry_run = dry_run
         DATA_DIR.mkdir(exist_ok=True, parents=True)
         self.db = Database(db_path)
         self.checker = Checker(self.config)
         self.target_ids = self.db.sync_targets(self.config.targets)
-        removed = self.db.prune_targets(t.name for t in self.config.targets)
-        if removed:
-            logger.info("Pruned %d target(s) no longer in the configuration", removed)
-            self.target_ids = self.db.sync_targets(self.config.targets)
+        if not dry_run:
+            removed = self.db.prune_targets((t.name for t in self.config.targets),
+                                            grace_days=TARGET_GRACE_DAYS)
+            if removed:
+                logger.info("Pruned %d target(s) absent from the configuration for %d days",
+                            removed, TARGET_GRACE_DAYS)
+                self.target_ids = self.db.sync_targets(self.config.targets)
+            stale_certs = self.db.prune_certs(self.config.cert_hosts())
+            if stale_certs:
+                logger.info("Forgot the certificates of %d host(s) no longer monitored",
+                            stale_certs)
         self.engine = IncidentEngine(self.db, self.config, self.target_ids)
-        self.notifier = EmailNotifier(self.config, self.db, dry_run=dry_run)
+        self.notifier = Notifier(self.config, self.db, dry_run=dry_run)
 
     def close(self) -> None:
         self.db.close()
@@ -1753,40 +2478,61 @@ class WebsiteMonitor:
 
         transitions: List[Transition] = []
         for target, healthy, details in results:
-            transition = self.engine.apply(
-                target, healthy, details, run_ts, run_id=run_id,
-                cold_start=cold_start,
-                suppress="monitor_network" if suppress and not healthy else None,
-            )
+            try:
+                transition = self.engine.apply(
+                    target, healthy, details, run_ts, run_id=run_id,
+                    cold_start=cold_start,
+                    suppress="monitor_network" if suppress and not healthy else None,
+                )
+            except Exception as exc:  # noqa: BLE001 - one target must not stop the run
+                logger.error("Could not record the check of %s: %s",
+                             mask_secrets(target.name), exc, exc_info=True)
+                transition = Transition(target=target, healthy=healthy, details=details)
             transitions.append(transition)
             label = "API" if target.kind == "api" else "Website"
             if healthy:
-                logger.info("✓ %s: %s - OK (%s, %sms)", label, target.name,
+                logger.info("✓ %s: %s - OK (%s, %sms)", label, mask_secrets(target.name),
                             details.get("status_code"), details.get("response_time_ms"))
             else:
-                logger.error("✗ %s: %s - FAILED: %s", label, target.name,
+                logger.error("✗ %s: %s - FAILED: %s", label, mask_secrets(target.name),
                              details.get("error"))
 
         if self.config.ssl_check_enabled:
-            transitions_ssl = self._check_certificates(run_ts)
+            tls_warnings = self._check_certificates(run_ts)
         else:
-            transitions_ssl = []
+            tls_warnings = []
 
         n_failed = sum(1 for _, healthy, _ in results if not healthy)
-        self.notifier.dispatch(transitions, run_ts, banner=banner)
-        for subject, body in transitions_ssl:
-            self.notifier.send(subject, body, kind="SSL",
-                               dedup_key=f"SSL:{subject}:{run_ts.date()}")
+        # Recoveries announced to nobody yet, because their message failed earlier.
+        transitions_out = transitions + self.engine.pending_recoveries(
+            run_ts, (t.incident_id for t in transitions if t.kind == "RESOLVED"))
+        self.notifier.dispatch(transitions_out, run_ts, banner=banner,
+                               suspect_self=bool(suppress))
+        undelivered = self.engine.settle(transitions_out)
+        for subject, body, host, prev_stage in tls_warnings:
+            state = self.notifier.deliver(subject, body, kind="TLS",
+                                          dedup_key=f"TLS:{subject}:{run_ts.date()}")
+            if state in RETRY_STATES:
+                # Probe again at the next pass, and warn again from the old stage.
+                self.db.execute(
+                    "UPDATE certs SET warn_stage = ?, last_checked_at = NULL WHERE host = ?",
+                    (prev_stage, host))
+                undelivered += 1
 
         duration_ms = int((time.monotonic() - started) * 1000)
         self.db.execute(
             "UPDATE runs SET finished_at = ?, duration_ms = ?, n_failed = ? WHERE id = ?",
             (now_utc().isoformat(), duration_ms, n_failed, run_id),
         )
-        self.db.set_meta("first_run_done", now_utc().isoformat())
+        if not self.dry_run:
+            # A dry run (the installer makes one) must not use up the cold start.
+            self.db.set_meta("first_run_done", now_utc().isoformat())
         self._housekeeping()
-        self._heartbeat(n_failed)
-        logger.info("Run complete in %.1fs — %d/%d healthy",
+        self._heartbeat(n_failed, undelivered)
+        if undelivered and not self.dry_run:
+            logger.error("%s left undelivered, to be tried again at the next pass",
+                         plural(undelivered, "message"))
+        logger.info("Run complete in %.1fs: %d/%d healthy",
                     duration_ms / 1000, len(results) - n_failed, len(results))
         return transitions
 
@@ -1804,8 +2550,9 @@ class WebsiteMonitor:
         gap = (run_ts - last).total_seconds()
         expected = self.config.check_interval or 3600
         if gap > max(3 * expected, 3 * 3600):
-            return (f"Monitoring gap of {human_duration(gap)} since the last completed run — "
-                    f"outage start times in this alert are lower bounds.")
+            return (f"Monitoring gap of {human_duration(gap)} since the last completed run: "
+                    f"an outage in this alert may have begun earlier than shown, "
+                    f"and lasted longer.")
         return None
 
     def _detect_monitor_side_failure(
@@ -1831,26 +2578,35 @@ class WebsiteMonitor:
             t.host in ("127.0.0.1", "localhost", "::1") for t, _ in failed)
         detail = (" A localhost target also failed, so this is very likely local."
                   if local_down else "")
-        return (f"{len(failed)}/{len(results)} targets failed at once with network errors — "
+        return (f"{len(failed)}/{len(results)} targets failed at once with network errors; "
                 f"this may be a problem with the monitoring host or its network, "
                 f"not with the sites themselves.{detail}")
 
     # -- certificates ------------------------------------------------------
 
-    def _check_certificates(self, run_ts: datetime) -> List[Tuple[str, str]]:
-        """Probe TLS expiry at most once a day per host; warn on threshold crossings."""
-        alerts: List[Tuple[str, str]] = []
-        hosts: Dict[str, Target] = {}
-        for target in self.config.targets:
-            if target.wants_cert_check() and target.host:
-                hosts.setdefault(target.host, target)
+    def _check_certificates(self, run_ts: datetime) -> List[Tuple[str, str, str, int]]:
+        """Probe TLS expiry at most twice a day per host; warn on threshold crossings.
 
-        for host in sorted(hosts):
+        Returns (subject, body, host, previous warning stage) for each warning, so
+        that a warning whose message fails can be put back and sent again."""
+        alerts: List[Tuple[str, str, str, int]] = []
+        for host in sorted(self.config.cert_hosts()):
             row = self.db.query_one("SELECT * FROM certs WHERE host = ?", (host,))
             last = _parse_dt(row["last_checked_at"]) if row else None
             if last and (run_ts - last) < timedelta(hours=12):
                 continue
-            info = check_certificate(host)
+            info = check_certificate(*split_cert_key(host))
+            if info["error"]:
+                # Keep what the last good probe learnt: wiping the expiry and the
+                # warning stage made the host vanish from the summaries, then
+                # repeated a warning already sent at the next good probe.
+                self.db.execute(
+                    "INSERT INTO certs(host, last_checked_at, error) VALUES(?,?,?) "
+                    "ON CONFLICT(host) DO UPDATE SET last_checked_at=excluded.last_checked_at, "
+                    "error=excluded.error",
+                    (host, run_ts.isoformat(), info["error"]))
+                logger.warning("Certificate check failed for %s: %s", host, info["error"])
+                continue
             not_after = _parse_dt(info["not_after"])
             days_left = (not_after - run_ts).days if not_after else None
             prev_stage = (row["warn_stage"] if row else 0) or 0
@@ -1862,33 +2618,34 @@ class WebsiteMonitor:
                         stage = i
             self.db.execute(
                 "INSERT INTO certs(host, not_after, issuer, last_checked_at, warn_stage, error) "
-                "VALUES(?,?,?,?,?,?) ON CONFLICT(host) DO UPDATE SET "
+                "VALUES(?,?,?,?,?,NULL) ON CONFLICT(host) DO UPDATE SET "
                 "not_after=excluded.not_after, issuer=excluded.issuer, "
                 "last_checked_at=excluded.last_checked_at, warn_stage=excluded.warn_stage, "
-                "error=excluded.error",
-                (host, info["not_after"], info["issuer"], run_ts.isoformat(), stage, info["error"]),
+                "error=NULL",
+                (host, info["not_after"], info["issuer"], run_ts.isoformat(), stage),
             )
-            if info["error"]:
-                logger.warning("Certificate check failed for %s: %s", host, info["error"])
-                continue
             logger.info("Certificate %s expires in %s days (%s)", host, days_left, info["issuer"])
-            if stage > prev_stage and days_left is not None:
+            if stage > prev_stage and days_left is not None and not_after is not None:
                 self.db.execute("UPDATE certs SET last_warned_at = ? WHERE host = ?",
                                 (run_ts.isoformat(), host))
-                subject = f"[TLS] Certificate for {host} expires in {days_left} day(s)"
+                subject = (f"[TLS] Certificate for {host} expires in "
+                           f"{plural(days_left, 'day')}")
                 body = (
                     f"TLS Certificate Expiry Warning\n{'=' * 40}\n\n"
                     f"Host:      {host}\n"
                     f"Expires:   {not_after.strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
                     f"Days left: {days_left}\n"
                     f"Issuer:    {info['issuer']}\n\n"
-                    "TLS on this host is terminated by a reverse proxy with its own ACME\n"
-                    "client. Renewal normally happens automatically around 30 days before\n"
-                    "expiry; this warning means it has not happened yet. Check the proxy's\n"
-                    "ACME logs and that its account/storage file is writable.\n\n"
+                    "A certificate renewed automatically (by certbot, acme.sh, Caddy,\n"
+                    "Traefik or another ACME client) is normally replaced well before it\n"
+                    "expires, so this warning means the renewal has not happened yet.\n"
+                    "Check the logs of the renewal client, that it can reach the\n"
+                    "certificate authority and answer its challenge (port 80 open, DNS\n"
+                    "records right), and that its account and storage files are\n"
+                    "writable. A certificate installed by hand has to be replaced by hand.\n\n"
                     f"-- Website Monitor v{__version__}\n"
                 )
-                alerts.append((subject, body))
+                alerts.append((subject, body, host, prev_stage))
         return alerts
 
     # -- periodic chores ---------------------------------------------------
@@ -1905,14 +2662,15 @@ class WebsiteMonitor:
         except Exception as exc:  # noqa: BLE001 - chores must never break a run
             logger.warning("Housekeeping failed: %s", exc)
 
-    def _heartbeat(self, n_failed: int) -> None:
+    def _heartbeat(self, n_failed: int, undelivered: int = 0) -> None:
         """Ping a dead-man's-switch service. This is the only mechanism that can
         detect the monitor itself being dead, which nothing previously could."""
         if not self.config.heartbeat_url or self.dry_run:
             return
+        params = {key: value for key, value in
+                  (("failed", n_failed), ("undelivered", undelivered)) if value}
         try:
-            requests.get(self.config.heartbeat_url, timeout=10,
-                         params={"failed": n_failed} if n_failed else None)
+            requests.get(self.config.heartbeat_url, timeout=10, params=params or None)
             logger.debug("Heartbeat sent")
         except RequestException as exc:
             logger.warning("Heartbeat failed: %s", exc)
@@ -1949,17 +2707,49 @@ class WebsiteMonitor:
 # Reporting
 # ---------------------------------------------------------------------------
 
+def _pct(value: Optional[float], digits: int = 2) -> str:
+    return f"{value:.{digits}f}%" if value is not None else "n/a"
+
+
+# Plain words for the failure classes, for the brief summary.
+FAIL_WORDS = {"dns": "name not resolved", "conn": "connection failed", "tls": "TLS error",
+              "timeout": "timeout", "content": "unexpected content", "unknown": "error"}
+
+
+def _short(name: str, url: str) -> str:
+    """A target named by its own address, as a chat shows it best: without the
+    scheme and the final slash (https://example.com/ is example.com)."""
+    if name != url:
+        return name
+    return re.sub(r"^[a-z][a-z0-9+.-]*://", "", name, flags=re.I).rstrip("/")
+
+
+def _cause(fail_class: Optional[str], status_code: Optional[int]) -> str:
+    if status_code and fail_class in (None, "http_status", "content"):
+        return f"HTTP {status_code}" if fail_class != "content" else "unexpected content"
+    return FAIL_WORDS.get(fail_class or "unknown", fail_class or "error")
+
+
 class Reporter:
-    """Builds uptime summaries from the stored check history."""
+    """Builds uptime summaries from the stored check history, in three forms: the
+    classic text and HTML email, a brief message for a chat or a phone, and JSON
+    for other programs. All three are drawn from one snapshot of the period."""
 
     def __init__(self, db: Database, config: Config):
         self.db = db
         self.config = config
 
+    def _names(self) -> List[str]:
+        return [t.name for t in self.config.targets]
+
     def stats(self, days: int) -> List[Dict[str, Any]]:
+        """Per target over the period, for the targets configured now (one removed
+        keeps its history for a while, but has no place in a summary)."""
         since = (now_utc() - timedelta(days=days)).isoformat()
+        names = self._names()
+        marks = ",".join("?" * len(names)) or "NULL"
         rows = self.db.query(
-            """
+            f"""
             SELECT t.name, t.url, t.kind, t.status,
                    COUNT(c.id)                                    AS checks,
                    SUM(CASE WHEN c.healthy = 0 THEN 1 ELSE 0 END) AS failures,
@@ -1967,14 +2757,16 @@ class Reporter:
                    MAX(CASE WHEN c.healthy = 1 THEN c.total_ms END) AS max_ms
               FROM targets t LEFT JOIN checks c
                 ON c.target_id = t.id AND c.ts >= ?
+             WHERE t.name IN ({marks})
              GROUP BY t.id ORDER BY t.id
-            """, (since,))
+            """, (since, *names))
         out = []
         for row in rows:
             checks = row["checks"] or 0
             failures = row["failures"] or 0
             out.append({
                 "name": row["name"], "url": row["url"], "kind": row["kind"],
+                "site": site_of(row["url"]),
                 "status": row["status"], "checks": checks, "failures": failures,
                 "uptime": (100.0 * (checks - failures) / checks) if checks else None,
                 "avg_ms": row["avg_ms"], "max_ms": row["max_ms"],
@@ -1990,53 +2782,129 @@ class Reporter:
         values = [r["total_ms"] for r in rows]
         if not values:
             return None
-        return values[min(len(values) - 1, int(len(values) * 0.95))]
+        # Nearest rank: the smallest value with at least 95% of the values at or
+        # below it (the former index gave the maximum whenever n was a multiple of 20).
+        return values[max(0, math.ceil(0.95 * len(values)) - 1)]
 
     def incidents(self, days: int) -> List[sqlite3.Row]:
+        """Incidents that overlapped the period, begun in it, ended in it or still
+        open, of the targets configured now."""
         since = (now_utc() - timedelta(days=days)).isoformat()
+        names = self._names()
+        marks = ",".join("?" * len(names)) or "NULL"
         return self.db.query(
-            "SELECT i.*, t.name FROM incidents i JOIN targets t ON t.id = i.target_id "
-            "WHERE i.started_at >= ? ORDER BY i.started_at DESC", (since,))
+            "SELECT i.*, t.name, t.url FROM incidents i JOIN targets t ON t.id = i.target_id "
+            f"WHERE (i.started_at >= ? OR i.ended_at >= ? OR i.status = 'open') "
+            f"AND t.name IN ({marks}) ORDER BY i.started_at DESC", (since, since, *names))
 
     def certs(self) -> List[sqlite3.Row]:
-        return self.db.query(
-            "SELECT * FROM certs WHERE not_after IS NOT NULL ORDER BY not_after")
+        """Certificates of the hosts monitored now, the soonest to expire first; a
+        host whose last probe failed has no expiry and comes last."""
+        hosts = set(self.config.cert_hosts())
+        rows = self.db.query("SELECT * FROM certs ORDER BY not_after IS NULL, not_after")
+        return [row for row in rows if row["host"] in hosts]
+
+    def last_run(self) -> Optional[datetime]:
+        row = self.db.query_one(
+            "SELECT finished_at FROM runs WHERE finished_at IS NOT NULL ORDER BY id DESC LIMIT 1")
+        return _parse_dt(row["finished_at"]) if row else None
+
+    def snapshot(self, days: int) -> Dict[str, Any]:
+        """Everything a summary says, gathered once."""
+        now = now_utc()
+        stats = self.stats(days)
+        limit = self.config.slow_threshold_ms
+        for s in stats:
+            s["slow"] = bool(limit and s["p95_ms"] and s["p95_ms"] > limit)
+            s["name"], s["url"] = mask_secrets(s["name"]), mask_secrets(s["url"])
+        measured = [s["uptime"] for s in stats if s["uptime"] is not None]
+
+        incidents = []
+        for row in self.incidents(days):
+            start, end = _parse_dt(row["started_at"]), _parse_dt(row["ended_at"])
+            incidents.append({
+                "target": mask_secrets(row["name"]), "url": mask_secrets(row["url"]),
+                "site": site_of(row["url"]),
+                "started_at": start, "ended_at": end, "open": row["status"] == "open",
+                "duration_s": ((end or now) - start).total_seconds() if start else None,
+                "fail_class": row["fail_class"], "status_code": row["status_code"],
+                "error": mask_secrets(row["last_error"] or row["first_error"]) or None,
+                "announced": (row["notify_count"] or 0) > 0,
+            })
+
+        certs = []
+        for row in self.certs():
+            expires = _parse_dt(row["not_after"])
+            certs.append({"host": row["host"], "not_after": expires,
+                          "days_left": (expires - now).days if expires else None,
+                          "issuer": row["issuer"], "error": row["error"]})
+
+        last_run = self.last_run()
+        # Three missed passes, and never less than half an hour, mean the monitor
+        # itself has stopped: a summary run by another scheduler can say so.
+        stale_after = max(3 * max(self.config.check_interval, 60), 1800)
+        return {
+            "now": now, "days": days, "stats": stats,
+            "overall": sum(measured) / len(measured) if measured else None,
+            "down": [s for s in stats if s["status"] == "down"],
+            "incidents": incidents, "certs": certs, "last_run": last_run,
+            "stale": last_run is None or (now - last_run).total_seconds() > stale_after,
+            "warn_days": max(self.config.ssl_warn_days) if self.config.ssl_warn_days else 0,
+        }
+
+    @staticmethod
+    def _subject(snap: Dict[str, Any], title: str) -> str:
+        count = len(snap["incidents"])
+        subject = (f"[{title}] Uptime {_pct(snap['overall'])}, "
+                   + (plural(count, "incident") if count else "no incident"))
+        if snap["down"]:
+            subject += f", {len(snap['down'])} down now"
+        if snap["stale"]:
+            subject += ", the monitor is not running"
+        return subject
+
+    @staticmethod
+    def _stale_text(snap: Dict[str, Any]) -> str:
+        last = snap["last_run"]
+        if last is None:
+            return "The monitor has not completed a check yet."
+        local = last.astimezone()
+        ago = human_duration((snap["now"] - last).total_seconds())
+        return (f"The monitor itself has not completed a check since "
+                f"{local.strftime('%d %b %H:%M')} ({local.strftime('%Z')}), {ago} ago; "
+                "its timer or cron entry may have stopped.")
 
     def render(self, days: int, title: str) -> Tuple[str, str, str]:
-        stats = self.stats(days)
-        incidents = self.incidents(days)
-        certs = self.certs()
-        now = now_utc()
-
-        measured = [s for s in stats if s["uptime"] is not None]
-        overall = sum(s["uptime"] for s in measured) / len(measured) if measured else 100.0
-        down_now = [s for s in stats if s["status"] == "down"]
-
-        subject = f"[{title}] Uptime {overall:.2f}% — {len(incidents)} incident(s)"
-        if down_now:
-            subject += f" — {len(down_now)} DOWN now"
+        """The classic summary: (subject, text table, HTML)."""
+        snap = self.snapshot(days)
+        stats, incidents, certs, now = snap["stats"], snap["incidents"], snap["certs"], snap["now"]
 
         lines = [f"{title + ' Monitoring Report':^72}", "=" * 72, "",
-                 f"Period:  last {days} day(s), to {now.strftime('%Y-%m-%d %H:%M')} UTC",
-                 f"Overall: {overall:.3f}% uptime across {len(stats)} targets", ""]
+                 f"Period:  last {plural(days, 'day')}, to {now.strftime('%Y-%m-%d %H:%M')} UTC",
+                 f"Overall: {_pct(snap['overall'], 3)} uptime across "
+                 f"{plural(len(stats), 'target')}"]
+        if snap["stale"]:
+            lines.append("!! " + self._stale_text(snap))
+        lines.append("")
         lines.append(f"{'TARGET':<42}{'UPTIME':>9}{'AVG':>9}{'P95':>9}")
         lines.append("-" * 72)
         for s in stats:
             uptime = f"{s['uptime']:.2f}%" if s["uptime"] is not None else "n/a"
             avg = f"{s['avg_ms']:.0f}ms" if s["avg_ms"] else "n/a"
             p95 = f"{s['p95_ms']:.0f}ms" if s["p95_ms"] else "n/a"
-            flag = "  ✗" if s["status"] == "down" else ""
+            flag = "  ✗" if s["status"] == "down" else "  ⏱" if s["slow"] else ""
             lines.append(f"{s['name'][:41]:<42}{uptime:>9}{avg:>9}{p95:>9}{flag}")
         lines.append("")
+        if any(s["slow"] for s in stats):
+            lines += [f"⏱ p95 above SLOW_THRESHOLD_MS ({self.config.slow_threshold_ms} ms)", ""]
 
         if incidents:
             lines += [f"Incidents ({len(incidents)}):", "-" * 72]
             for inc in incidents[:25]:
-                start = _parse_dt(inc["started_at"])
-                end = _parse_dt(inc["ended_at"])
-                dur = human_duration((end - start).total_seconds()) if (start and end) else "ongoing"
+                start = inc["started_at"]
+                dur = "ongoing" if inc["open"] else human_duration(inc["duration_s"] or 0)
                 lines.append(f"  {start.strftime('%m-%d %H:%M') if start else '?':<12}"
-                             f"{inc['name'][:34]:<36}{dur:>10}  {inc['fail_class'] or ''}")
+                             f"{inc['target'][:34]:<36}{dur:>10}  {inc['fail_class'] or ''}")
             lines.append("")
         else:
             lines += ["No incidents in this period.", ""]
@@ -2044,51 +2912,173 @@ class Reporter:
         if certs:
             lines += ["TLS certificates:", "-" * 72]
             for cert in certs:
-                exp = _parse_dt(cert["not_after"])
-                days_left = (exp - now).days if exp else None
-                mark = "  ⚠" if (days_left is not None and days_left <= 21) else ""
-                lines.append(f"  {cert['host'][:40]:<42}"
-                             f"{(str(days_left) + ' days') if days_left is not None else 'unknown':>12}"
-                             f"  {cert['issuer'] or ''}{mark}")
+                left = cert["days_left"]
+                mark = "  ⚠" if (left is not None and left <= snap["warn_days"]) else ""
+                shown = f"{left} days" if left is not None else "unknown"
+                lines.append(f"  {cert['host'][:40]:<42}{shown:>12}  "
+                             f"{cert['issuer'] or cert['error'] or ''}{mark}")
             lines.append("")
         lines.append(f"-- Website Monitor v{__version__}")
 
-        html = self._html(title, days, overall, stats, incidents, certs, now)
-        return subject, "\n".join(lines), html
+        return self._subject(snap, title), "\n".join(lines), self._html(title, snap)
 
-    def _html(self, title: str, days: int, overall: float, stats, incidents,
-              certs, now: datetime) -> str:
+    def render_brief(self, days: int, title: str) -> Tuple[str, str]:
+        """A short summary for a chat or a phone: the verdict first, then only what
+        needs attention, the slowest answers and the certificates."""
+        snap = self.snapshot(days)
+        stats, down, certs = snap["stats"], snap["down"], snap["certs"]
+        now = snap["now"].astimezone()
+        zone = now.strftime("%Z")
+        day_fmt = "%H:%M" if days == 1 else "%d %b %H:%M"
+
+        def at(dt: Optional[datetime]) -> str:
+            return dt.astimezone().strftime(day_fmt) if dt else "?"
+
+        def listing(items: List[str], limit: int = 6) -> str:
+            shown = ", ".join(items[:limit])
+            return shown + (f" and {len(items) - limit} more" if len(items) > limit else "")
+
+        past = [i for i in snap["incidents"] if not i["open"]]
+        opened = {i["target"]: i for i in snap["incidents"] if i["open"]}
+        below = sorted((s for s in stats if s["uptime"] is not None and s["uptime"] < 100
+                        and s["status"] != "down"), key=lambda s: s["uptime"])
+        slow = sorted((s for s in stats if s["slow"]), key=lambda s: -s["p95_ms"])
+        valid = [c for c in certs if c["days_left"] is not None]
+        expiring = [c for c in valid if c["days_left"] <= snap["warn_days"]]
+        unchecked = [c for c in certs if c["days_left"] is None]
+
+        if snap["stale"] or down:
+            mark = "❌"
+        elif snap["incidents"] or below or slow or expiring or unchecked:
+            mark = "⚠️"
+        else:
+            mark = "✅"
+        total = len(stats)
+        if down:
+            state = f"{len(down)} of {plural(total, 'target')} down now"
+        elif total == 1:
+            state = "the only target up"
+        else:
+            state = f"all {plural(total, 'target')} up"
+        span = "24 hours" if days == 1 else plural(days, "day")
+        count = len(snap["incidents"])
+        lines = [f"{mark} {title} summary: {state}, {_pct(snap['overall'])} uptime over the "
+                 f"{span} to {now.strftime('%H:%M')} ({zone}), "
+                 f"{plural(count, 'incident') if count else 'no incident'}."]
+        if snap["stale"]:
+            lines.append(self._stale_text(snap))
+        if down:
+            parts = []
+            for s in down:
+                inc = opened.get(s["name"])
+                name = _short(s["name"], s["url"])
+                parts.append(f"{name} since {at(inc['started_at'])} "
+                             f"({_cause(inc['fail_class'], inc['status_code'])})"
+                             if inc else name)
+            lines.append(f"Down now: {listing(parts)}.")
+        if past:
+            lines.append("Incidents: " + listing([
+                f"{_short(i['target'], i['url'])} at {at(i['started_at'])} for "
+                f"{human_duration(i['duration_s'] or 0)} "
+                f"({_cause(i['fail_class'], i['status_code'])})" for i in past]) + ".")
+        if below:
+            lines.append("Below 100%: " + listing(
+                [f"{_short(s['name'], s['url'])} {_pct(s['uptime'])}" for s in below]) + ".")
+        if slow:
+            lines.append(f"Slow (p95 above {self.config.slow_threshold_ms} ms): " + listing(
+                [f"{_short(s['name'], s['url'])} {s['p95_ms']:.0f} ms" for s in slow]) + ".")
+        else:
+            slowest = sorted((s for s in stats if s["p95_ms"]), key=lambda s: -s["p95_ms"])
+            if slowest:
+                lines.append("Slowest answers (p95): " + ", ".join(
+                    f"{_short(s['name'], s['url'])} {s['p95_ms']:.0f} ms"
+                    for s in slowest[:3]) + ".")
+        if expiring:
+            lines.append("Certificates expiring soon: " + listing(
+                [f"{c['host']} in {plural(c['days_left'], 'day')}" for c in expiring]) + ".")
+        if unchecked:
+            lines.append("Certificate checks failed: " + listing(
+                [f"{c['host']} ({c['error'] or 'no answer'})" for c in unchecked]) + ".")
+        if valid and not expiring:
+            soonest = min(c["days_left"] for c in valid)
+            first = [c["host"] for c in valid if c["days_left"] == soonest]
+            others = f" and {len(first) - 1} more" if len(first) > 1 else ""
+            lines.append(f"Certificates: {plural(len(valid), 'valid certificate')}, the earliest "
+                         f"expiring in {plural(soonest, 'day')} ({first[0]}{others}).")
+        return self._subject(snap, title), "\n".join(lines)
+
+    def render_json(self, days: int, title: str) -> str:
+        """The summary for other programs."""
+        snap = self.snapshot(days)
+
+        def iso(dt: Optional[datetime]) -> Optional[str]:
+            return dt.isoformat() if dt else None
+
+        data = {
+            "monitor": "Website Monitor", "version": __version__,
+            "host": socket.gethostname(), "report": title.lower(), "period_days": days,
+            "generated_at": iso(snap["now"]), "last_run_at": iso(snap["last_run"]),
+            "monitor_stale": snap["stale"], "overall_uptime": snap["overall"],
+            "slow_threshold_ms": self.config.slow_threshold_ms or None,
+            "targets": [{key: s[key] for key in (
+                "name", "url", "kind", "site", "status", "checks", "failures", "uptime",
+                "avg_ms", "max_ms", "p95_ms", "slow")} for s in snap["stats"]],
+            "incidents": [{
+                "target": i["target"], "site": i["site"], "started_at": iso(i["started_at"]),
+                "ended_at": iso(i["ended_at"]), "open": i["open"], "duration_s": i["duration_s"],
+                "fail_class": i["fail_class"], "status_code": i["status_code"],
+                "error": i["error"], "announced": i["announced"]} for i in snap["incidents"]],
+            "certificates": [{
+                "host": c["host"], "not_after": iso(c["not_after"]), "days_left": c["days_left"],
+                "issuer": c["issuer"], "error": c["error"]} for c in snap["certs"]],
+        }
+        return json.dumps(data, indent=2)
+
+    def _html(self, title: str, snap: Dict[str, Any]) -> str:
+        days, overall, stats = snap["days"], snap["overall"], snap["stats"]
+        incidents, certs, now = snap["incidents"], snap["certs"], snap["now"]
+
         def bar(pct: Optional[float]) -> str:
             if pct is None:
                 return '<span style="color:#9aa5b1">n/a</span>'
             color = "#2f9e44" if pct >= 99.9 else "#f0932b" if pct >= 99 else "#d64545"
             return (f'<span style="color:{color};font-weight:600">{pct:.2f}%</span>')
 
-        def ms(value: Optional[float]) -> str:
+        def ms_plain(value: Optional[float]) -> str:
             return f"{value:.0f} ms" if value else "\u2014"
+
+        def ms(value: Optional[float], slow: bool = False) -> str:
+            text = ms_plain(value)
+            return (f'<span style="color:#d64545;font-weight:600">{text}</span>'
+                    if slow and value else text)
 
         cell = ('<td style="padding:7px 8px;border-bottom:1px solid #f0f2f5;'
                 'text-align:right;font-size:12px;color:#616e7c">')
         rows = "".join(
             '<tr><td style="padding:7px 8px;border-bottom:1px solid #f0f2f5;'
-            'font-size:13px">' + s["name"][:46] + '</td>'
+            'font-size:13px">' + _esc(s["name"][:46]) + '</td>'
             '<td style="padding:7px 8px;border-bottom:1px solid #f0f2f5;'
             'text-align:right;font-size:13px">' + bar(s["uptime"]) + '</td>'
             + cell + ms(s["avg_ms"]) + '</td>'
-            + cell + ms(s["p95_ms"]) + '</td></tr>'
+            + cell + ms(s["p95_ms"], s["slow"]) + '</td></tr>'
             for s in stats)
+
+        stale_html = ""
+        if snap["stale"]:
+            stale_html = ('<p style="margin:0 0 14px;padding:10px 12px;background:#fdf3f3;'
+                          'border-left:3px solid #d64545;font-size:13px">'
+                          f'{_esc(self._stale_text(snap))}</p>')
 
         inc_html = ""
         if incidents:
             items = []
             for inc in incidents[:15]:
-                start = _parse_dt(inc["started_at"])
-                end = _parse_dt(inc["ended_at"])
-                dur = human_duration((end - start).total_seconds()) if (start and end) else "ongoing"
+                start = inc["started_at"]
+                dur = "ongoing" if inc["open"] else human_duration(inc["duration_s"] or 0)
                 items.append(
                     f'<li style="margin:4px 0;font-size:12px;color:#52606d">'
-                    f'<strong>{inc["name"]}</strong> — {dur}'
-                    f'<span style="color:#9aa5b1"> · {inc["fail_class"] or ""} · '
+                    f'<strong>{_esc(inc["target"])}</strong>, {dur}'
+                    f'<span style="color:#9aa5b1"> · {_esc(inc["fail_class"] or "")} · '
                     f'{start.strftime("%b %d %H:%M") if start else ""} UTC</span></li>')
             inc_html = ('<p style="margin:22px 0 6px;font-weight:600;font-size:14px">Incidents</p>'
                         f'<ul style="margin:0;padding-left:18px">{"".join(items)}</ul>')
@@ -2096,27 +3086,30 @@ class Reporter:
         cert_html = ""
         if certs:
             items = []
+            warn = snap["warn_days"]
             for cert in certs:
-                exp = _parse_dt(cert["not_after"])
-                left = (exp - now).days if exp else None
-                color = ("#d64545" if left is not None and left <= 7
-                         else "#f0932b" if left is not None and left <= 21 else "#616e7c")
+                left = cert["days_left"]
+                color = ("#d64545" if left is None or left <= min(7, warn)
+                         else "#f0932b" if left <= warn else "#616e7c")
+                shown = f"{left} days" if left is not None else _esc(cert["error"] or "unknown")
                 items.append(
-                    f'<li style="margin:4px 0;font-size:12px;color:#52606d">{cert["host"]} — '
-                    f'<span style="color:{color};font-weight:600">'
-                    f'{left if left is not None else "?"} days</span></li>')
+                    f'<li style="margin:4px 0;font-size:12px;color:#52606d">'
+                    f'{_esc(cert["host"])}: '
+                    f'<span style="color:{color};font-weight:600">{shown}</span></li>')
             cert_html = ('<p style="margin:22px 0 6px;font-weight:600;font-size:14px">'
                          'TLS certificates</p>'
                          f'<ul style="margin:0;padding-left:18px">{"".join(items)}</ul>')
 
-        color = "#2f9e44" if overall >= 99.9 else "#f0932b" if overall >= 99 else "#d64545"
-        return EmailNotifier._shell(
+        value = overall if overall is not None else 0.0
+        color = "#2f9e44" if value >= 99.9 else "#f0932b" if value >= 99 else "#d64545"
+        return Notifier._shell(
             f"{title} Report",
             "#334e68",
+            f'{stale_html}'
             f'<p style="margin:0 0 4px;font-size:30px;font-weight:700;color:{color}">'
-            f'{overall:.2f}%</p>'
+            f'{_pct(overall)}</p>'
             f'<p style="margin:0 0 18px;font-size:12px;color:#7b8794">'
-            f'average uptime · last {days} day(s) · {len(stats)} targets</p>'
+            f'average uptime · last {plural(days, "day")} · {plural(len(stats), "target")}</p>'
             f'<table role="presentation" width="100%" style="border-collapse:collapse">'
             f'<tr><th style="text-align:left;padding:6px 8px;font-size:11px;color:#7b8794;'
             f'text-transform:uppercase;border-bottom:2px solid #e4e7eb">Target</th>'
@@ -2138,8 +3131,9 @@ def print_status(db: Database, config: Config) -> None:
     reporter = Reporter(db, config)
     stats = reporter.stats(7)
     now = now_utc()
-    print(f"\n  Website Monitor v{__version__} — status at "
-          f"{now.strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
+    print(f"\n  Website Monitor v{__version__}, status at "
+          f"{now.strftime('%Y-%m-%d %H:%M:%S')} UTC")
+    print(f"  Messages: {config.route_text()}\n")
     print(f"  {'TARGET':<40}{'STATE':>9}{'7d UPTIME':>12}{'AVG':>10}{'LAST SEEN':>18}")
     print("  " + "-" * 87)
     rows = {r["name"]: r for r in db.query("SELECT * FROM targets")}
@@ -2161,32 +3155,44 @@ def print_status(db: Database, config: Config) -> None:
         for inc in open_incidents:
             started = _parse_dt(inc["started_at"])
             dur = human_duration((now - started).total_seconds()) if started else "?"
-            print(f"    ✗ {inc['name']} — down {dur} ({inc['fail_class'] or 'unknown'})"
-                  f" — {inc['last_error'] or ''}")
+            held = ", held while flapping" if inc["suppressed_by"] == "flap" else ""
+            print(f"    ✗ {inc['name']}: down {dur} ({inc['fail_class'] or 'unknown'}{held}), "
+                  f"{inc['last_error'] or ''}")
+    flapping = [row for row in rows.values() if row["flapping_since"]]
+    if flapping:
+        print(f"\n  Flapping ({len(flapping)}):")
+        for row in flapping:
+            since = _parse_dt(row["flapping_since"])
+            print(f"    ~ {row['name']}, since {since.strftime('%m-%d %H:%M UTC') if since else '?'}")
     certs = reporter.certs()
     if certs:
+        warn_days = max(config.ssl_warn_days) if config.ssl_warn_days else 0
         print("\n  TLS certificates:")
         for cert in certs:
             exp = _parse_dt(cert["not_after"])
             left = (exp - now).days if exp else None
-            warn = "  ⚠" if (left is not None and left <= 21) else ""
-            print(f"    {cert['host']:<42}{str(left) + ' days' if left is not None else '?':>10}"
-                  f"  {cert['issuer'] or ''}{warn}")
+            warn = "  ⚠" if (left is None or left <= warn_days) else ""
+            shown = f"{left} days" if left is not None else "?"
+            print(f"    {cert['host']:<42}{shown:>10}"
+                  f"  {cert['issuer'] or cert['error'] or ''}{warn}")
     print()
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="monitor.py",
-        description="Website, API and TLS monitoring with email alerting.",
+        description="Website, API and TLS monitoring with alerts by email or by a command.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Examples:\n"
-               "  monitor.py                      run one pass (cron default)\n"
-               "  monitor.py --dry-run -v         check everything, send nothing\n"
-               "  monitor.py --status             show current state from the database\n"
-               "  monitor.py --report weekly      email an uptime summary\n"
-               "  monitor.py --check https://x.y  probe one URL and exit\n"
-               "  monitor.py --test-email         verify SMTP settings\n",
+               "  monitor.py                                run one pass (cron default)\n"
+               "  monitor.py --dry-run -v                   check everything, send nothing\n"
+               "  monitor.py --status                       show current state and routes\n"
+               "  monitor.py --report weekly                send an uptime summary\n"
+               "  monitor.py --report daily --print --format brief\n"
+               "                                            print a short summary for a chat\n"
+               "  monitor.py --check https://x.y            probe one URL and exit\n"
+               "  monitor.py --test-email                   verify SMTP settings\n"
+               "  monitor.py --test-command                 verify MESSAGE_COMMAND\n",
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--once", action="store_true",
@@ -2196,16 +3202,23 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     mode.add_argument("--status", action="store_true",
                       help="print current state and exit")
     mode.add_argument("--report", choices=("daily", "weekly", "monthly"),
-                      help="email an uptime summary and exit")
+                      help="send an uptime summary by ROUTE_SUMMARY and exit")
     mode.add_argument("--check", metavar="URL",
-                      help="probe a single URL and exit (no state, no email)")
+                      help="probe a single URL and exit (no state, no message)")
     mode.add_argument("--test-email", action="store_true",
                       help="send a test message to ALERT_EMAIL and exit")
+    mode.add_argument("--test-command", action="store_true",
+                      help="send a test message through MESSAGE_COMMAND and exit")
     mode.add_argument("--notify", metavar="SUBJECT",
-                      help="send an arbitrary message (for other scripts to reuse)")
+                      help="send an arbitrary message by ROUTE_NOTIFY (for other scripts)")
 
     parser.add_argument("--body-file", metavar="PATH",
-                        help="with --notify: read the email body from this file")
+                        help="with --notify: read the message body from this file")
+    parser.add_argument("--print", dest="print_only", action="store_true",
+                        help="with --report: print the summary instead of sending it")
+    parser.add_argument("--format", choices=("text", "brief", "json"),
+                        help="with --report: the classic table (text, the default), a short "
+                             "message for a chat or a phone (brief), or JSON for other programs")
     parser.add_argument("--dry-run", action="store_true",
                         help="perform checks and update state but never send email")
     parser.add_argument("--config", metavar="PATH", help="path to a targets.toml file")
@@ -2215,41 +3228,99 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _emergency_notify(subject: str, body: str) -> None:
-    """Best-effort alert when the monitor itself cannot start.
+# The notice of a broken configuration is repeated at most this often while the
+# error stays the same; a different error is announced at once.
+BROKEN_REPEAT_S = 6 * 3600
+
+
+def _broken_stamp() -> Path:
+    return DATA_DIR / ".broken-notice"
+
+
+def _broken_notice_due(error: str) -> bool:
+    try:
+        stamp = json.loads(_broken_stamp().read_text())
+    except (OSError, ValueError):
+        return True
+    same = stamp.get("error") == hashlib.sha256(error.encode()).hexdigest()
+    sent = _parse_dt(stamp.get("sent_at"))
+    return not (same and sent and (now_utc() - sent).total_seconds() < BROKEN_REPEAT_S)
+
+
+def _broken_notice_sent(error: str) -> None:
+    try:
+        _broken_stamp().parent.mkdir(exist_ok=True, parents=True)
+        _broken_stamp().write_text(json.dumps({
+            "error": hashlib.sha256(error.encode()).hexdigest(),
+            "sent_at": now_utc().isoformat()}))
+    except OSError as exc:
+        logger.warning("Could not record the configuration-failure notice: %s", exc)
+
+
+def _emergency_notify(subject: str, body: str) -> bool:
+    """Best-effort message when the configuration cannot be used, from the raw
+    settings: mail if they allow it, else MESSAGE_COMMAND, else the spare route.
+    Returns True when it left.
 
     A broken .env used to produce a silent traceback in cron.log and nothing else.
     """
     try:
         server_host = (os.getenv("SMTP_SERVER") or "").strip()
-        username = os.getenv("SMTP_USERNAME")
-        password = os.getenv("SMTP_PASSWORD")
+        username = (os.getenv("SMTP_USERNAME") or "").strip()
+        password = os.getenv("SMTP_PASSWORD") or ""
+        sender = (os.getenv("SMTP_FROM") or "").strip() or username
         recipients = [a.strip() for a in (os.getenv("ALERT_EMAIL") or "").split(",") if a.strip()]
-        if server_host and username and password and recipients:
+        if server_host and sender and recipients and bool(username) == bool(password):
             try:
                 msg = MIMEText(body, "plain", "utf-8")
-                msg["From"] = username
+                msg["From"] = sender
                 msg["To"] = ", ".join(recipients)
                 msg["Subject"] = subject
                 msg["Date"] = formatdate(localtime=True)
-                msg["Message-ID"] = make_msgid(domain=_sender_domain(username))
+                msg["Message-ID"] = make_msgid(domain=_sender_domain(sender))
                 msg["Auto-Submitted"] = "auto-generated"
                 security = (os.getenv("SMTP_SECURITY", "starttls") or "starttls").lower()
                 with closing(_smtp_connect(server_host, _env_int("SMTP_PORT", 587),
                                            security, 30)) as server:
-                    server.login(username, password)
+                    if username:
+                        server.login(username, password)
                     server.send_message(msg)
-                logger.info("Sent configuration-failure notification")
-                return
+                logger.info("Sent: %s", subject)
+                return True
             except (smtplib.SMTPException, OSError) as exc:
-                logger.error("Could not mail the configuration-failure notification: %s", exc)
-        run_fallback((os.getenv("FALLBACK_COMMAND") or "").strip(), subject, body)
+                logger.error("Could not mail %r: %s", subject, exc)
+        # A server without mail may still have a command of its own.
+        command = (os.getenv("MESSAGE_COMMAND") or "").strip()
+        if command and run_command(command, subject, body, "BROKEN")[0]:
+            logger.info("Sent by command: %s", subject)
+            return True
+        spare = (os.getenv("FALLBACK_COMMAND") or "").strip()
+        if spare and spare != command:
+            return run_fallback(spare, subject, body, "BROKEN")
     except Exception as exc:  # noqa: BLE001 - this path must never raise
-        logger.error("Could not send configuration-failure notification: %s", exc)
+        logger.error("Could not send %r: %s", subject, exc)
+    return False
+
+
+def _notify_body(args: argparse.Namespace) -> str:
+    body = ""
+    if args.body_file:
+        try:
+            body = Path(args.body_file).read_text(errors="replace")[-8000:]
+        except OSError as exc:
+            body = f"(could not read {args.body_file}: {exc})"
+    return (f"Host: {socket.gethostname()}\n"
+            f"Time: {now_utc().strftime('%Y-%m-%d %H:%M:%S')} UTC\n\n{body}")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
+    if (args.print_only or args.format) and not args.report:
+        print("--print and --format go with --report", file=sys.stderr)
+        return 2
+    # The database, its journal and the logs hold an inventory of the servers and
+    # their errors: readable by their owner only, with or without install.sh.
+    os.umask(0o077)
 
     console_level = "DEBUG" if args.verbose else "ERROR" if args.quiet else None
     # Logging is configured BEFORE the configuration is parsed, so that a bad
@@ -2274,18 +3345,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(json.dumps(check_certificate(target.host), indent=2, default=str))
         return 0 if healthy else 1
 
+    messaging_only = bool(args.notify or args.test_email or args.test_command)
     try:
-        config = Config(targets_file=Path(args.config) if args.config else None)
+        config = Config(targets_file=Path(args.config) if args.config else None,
+                        check_targets=not messaging_only)
     except ConfigError as exc:
         logger.critical("Configuration error: %s", exc)
-        _emergency_notify(
-            "[MONITOR BROKEN] Website monitor cannot start",
-            f"The website monitor failed to start at "
-            f"{now_utc().strftime('%Y-%m-%d %H:%M:%S')} UTC.\n\n"
-            f"Configuration error: {exc}\n\n"
-            f"Host: {socket.gethostname()}\nPath: {BASE_DIR}\n\n"
-            "No websites are being monitored until this is fixed.\n",
-        )
+        if args.notify:
+            # The message handed over goes out all the same, by the raw settings:
+            # a broken configuration must not swallow a security alert.
+            body = (_notify_body(args) + "\n\nNote: the configuration of the website "
+                    f"monitor is broken ({exc}), so this message left by the raw settings.\n")
+            return 0 if _emergency_notify(args.notify, body) else 2
+        if _broken_notice_due(str(exc)):
+            sent = _emergency_notify(
+                "[MONITOR BROKEN] Website monitor cannot start",
+                f"The website monitor failed to start at "
+                f"{now_utc().strftime('%Y-%m-%d %H:%M:%S')} UTC.\n\n"
+                f"Configuration error: {exc}\n\n"
+                f"Host: {socket.gethostname()}\nPath: {BASE_DIR}\n\n"
+                "No websites are being monitored until this is fixed. This notice is\n"
+                f"repeated every {human_duration(BROKEN_REPEAT_S)} while the error lasts.\n",
+            )
+            if sent:
+                _broken_notice_sent(str(exc))
         return 2
     except Exception as exc:  # noqa: BLE001
         logger.critical("Unexpected startup failure: %s", exc, exc_info=True)
@@ -2294,35 +3377,37 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     setup_logging(config.log_level, console_level=console_level,
                   retention_days=config.log_retention_days)
 
-    if args.test_email:
-        notifier = EmailNotifier(config)
-        ok = notifier.send(
+    if args.test_email or args.test_command:
+        channel = "email" if args.test_email else "command"
+        problem = (config.email_problem() if channel == "email"
+                   else None if config.message_command else "MESSAGE_COMMAND is empty")
+        if problem:
+            print(f"Cannot test the {channel} channel: {problem}", file=sys.stderr)
+            return 1
+        delivery = (f"SMTP: {config.smtp_server}:{config.smtp_port} ({config.smtp_security})\n"
+                    f"Sender: {config.smtp_from}\n" if channel == "email"
+                    else "Command: MESSAGE_COMMAND\n")
+        state = Notifier(config).deliver(
             "[TEST] Website Monitor configuration check",
             f"This is a test message from the website monitor on "
-            f"{socket.gethostname()}.\n\n"
+            f"{socket.gethostname()}, sent by the {channel} channel.\n\n"
             f"Sent: {now_utc().strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
-            f"SMTP: {config.smtp_server}:{config.smtp_port} ({config.smtp_security})\n"
-            f"Sender: {config.smtp_username}\n"
+            f"{delivery}"
+            f"Routes: {config.route_text()}\n"
             f"Spare route: {'configured' if config.fallback_command else 'none'}\n"
             f"Targets configured: {len(config.targets)} "
             f"({len(config.websites)} websites, {len(config.api_endpoints)} APIs)\n"
             f"Config source: {config.targets_source}\n\n"
-            "If you received this, alerting works.\n",
-            kind="TEST")
-        print("Test email sent." if ok else "Test email FAILED - see the log.")
-        return 0 if ok else 1
+            "If you received this, the channel works.\n",
+            kind="TEST", channels=[channel])
+        print(f"Test message sent by {channel}." if state == "sent"
+              else f"Test message by {channel} FAILED, see the log.")
+        return 0 if state == "sent" else 1
 
     if args.notify:
-        body = ""
-        if args.body_file:
-            try:
-                body = Path(args.body_file).read_text(errors="replace")[-8000:]
-            except OSError as exc:
-                body = f"(could not read {args.body_file}: {exc})"
-        body = (f"Host: {socket.gethostname()}\n"
-                f"Time: {now_utc().strftime('%Y-%m-%d %H:%M:%S')} UTC\n\n{body}")
-        ok = EmailNotifier(config, dry_run=args.dry_run).send(args.notify, body, kind="NOTIFY")
-        return 0 if ok else 1
+        state = Notifier(config, dry_run=args.dry_run).deliver(
+            args.notify, _notify_body(args), kind="NOTIFY")
+        return 0 if state in HARMLESS_STATES else 1
 
     if args.status:
         db = Database()
@@ -2334,16 +3419,25 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.report:
         days = {"daily": 1, "weekly": 7, "monthly": 30}[args.report]
+        title = args.report.capitalize()
         db = Database()
         try:
-            subject, body, html = Reporter(db, config).render(days, args.report.capitalize())
-            notifier = EmailNotifier(config, db, dry_run=args.dry_run)
-            if args.dry_run:
+            reporter = Reporter(db, config)
+            html: Optional[str] = None
+            if args.format == "brief":
+                subject, body = reporter.render_brief(days, title)
+            elif args.format == "json":
+                subject = f"[{title}] Website Monitor summary"
+                body = reporter.render_json(days, title)
+            else:
+                subject, body, html = reporter.render(days, title)
+            if args.print_only or args.dry_run:
                 print(body)
                 return 0
-            ok = notifier.send(subject, body, html, kind="SUMMARY",
-                               dedup_key=f"SUMMARY:{args.report}:{now_utc().date()}")
-            return 0 if ok else 1
+            state = Notifier(config, db).deliver(
+                subject, body, html, kind="SUMMARY",
+                dedup_key=f"SUMMARY:{args.report}:{now_utc().date()}")
+            return 0 if state in HARMLESS_STATES else 1
         finally:
             db.close()
 

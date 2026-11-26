@@ -72,7 +72,9 @@ class TestGapDetection:
             ((now - timedelta(hours=9)).isoformat(), (now - timedelta(hours=9)).isoformat()))
         banner = mon._detect_gap(now)
         assert banner is not None and "Monitoring gap" in banner
-        assert "lower bounds" in banner
+        # After a gap an outage may have begun before the time shown: start times
+        # are upper bounds and durations lower bounds.
+        assert "begun earlier than shown" in banner and "lasted longer" in banner
 
     def test_normal_cadence_is_not_a_gap(self, mon):
         now = monitor.now_utc()

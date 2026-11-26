@@ -15,7 +15,7 @@ def _clean_env(monkeypatch, tmp_path):
         if key.startswith(("SMTP_", "ALERT_", "WEBSITES", "API_ENDPOINTS", "CHECK_",
                            "TIMEOUT", "MAX_", "LOG_", "SSL_", "HEARTBEAT", "GROUP_",
                            "FAILURE_", "DB_", "TARGETS_", "SLOW_", "USER_AGENT",
-                           "FALLBACK_")):
+                           "FALLBACK_", "ROUTE_", "MESSAGE_", "FLAP_")):
             monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("SMTP_SERVER", "mail.example.com")
     monkeypatch.setenv("SMTP_USERNAME", "monitor@example.com")
@@ -23,6 +23,13 @@ def _clean_env(monkeypatch, tmp_path):
     monkeypatch.setenv("ALERT_EMAIL", "alerts@example.com")
     monkeypatch.setenv("WEBSITES", "https://example.com,https://www.example.com")
     monkeypatch.setenv("SSL_CHECK_ENABLED", "false")
+    # The logs, the database and the lock of a test live in its own folder, never
+    # in the checkout's logs/ and data/, which a deployed monitor uses.
+    import monitor
+    monkeypatch.setattr(monitor, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(monitor, "DATA_DIR", tmp_path / "data")
+    monkeypatch.setattr(monitor, "DB_PATH", tmp_path / "data" / "monitor.db")
+    monkeypatch.setattr(monitor, "LOCK_PATH", tmp_path / "data" / ".monitor.lock")
 
 
 @pytest.fixture

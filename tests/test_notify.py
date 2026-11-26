@@ -24,16 +24,78 @@ def test_apex_and_www_coalesce_into_one_email(config):
     composed = notifier._compose_down(pair, monitor.now_utc(), None)
     assert len(composed) == 1
     subject, body, _html, _key = composed[0]
-    assert "example.com" in subject
+    assert subject == "[DOWN] app.example.com: 2 targets failing"
     # ...but both targets must still be individually visible.
     assert "app.example.com" in body and "www.app.example.com" in body
 
 
-def test_multiple_domains_named_in_subject(config):
+def test_a_subdomain_is_never_announced_as_its_parent(config):
+    """On 12 November 2026 an outage of a photo subdomain arrived titled with the
+    main domain, which reads as the main site being down."""
+    notifier = monitor.EmailNotifier(config, dry_run=True)
+    pair = [transition("https://photo.example.com"),
+            transition("https://www.photo.example.com")]
+    subject = notifier._compose_down(pair, monitor.now_utc(), None)[0][0]
+    assert subject == "[DOWN] photo.example.com: 2 targets failing"
+
+
+def test_one_target_is_singular(config):
+    notifier = monitor.EmailNotifier(config, dry_run=True)
+    subject = notifier._compose_down([transition("https://a.example.com")],
+                                     monitor.now_utc(), None)[0][0]
+    assert subject == "[DOWN] a.example.com: 1 target failing"
+
+
+def test_multiple_sites_named_in_subject(config):
     notifier = monitor.EmailNotifier(config, dry_run=True)
     items = [transition("https://a.example.com"), transition("https://b.example.net")]
     subject = notifier._compose_down(items, monitor.now_utc(), None)[0][0]
-    assert "2 domains" in subject and "2 targets" in subject
+    assert "2 sites" in subject and "2 targets" in subject
+    assert "a.example.com" in subject and "b.example.net" in subject
+
+
+def test_suspected_monitoring_host_is_in_the_subject(config):
+    notifier = monitor.EmailNotifier(config, dry_run=True)
+    subject = notifier._compose_down([transition("https://a.example.com")],
+                                     monitor.now_utc(), "banner", suspect_self=True)[0][0]
+    assert "monitoring host suspected" in subject
+
+
+def test_html_part_escapes_what_the_server_sent(config):
+    """A remote API's field values reach the error text; they must not become live
+    HTML (a tracking image, a fake login link) in the alert."""
+    notifier = monitor.EmailNotifier(config, dry_run=True)
+    t = transition("https://a.example.com",
+                   error="API field 'status' is '<img src=https://evil/x.gif>', expected 'ok'")
+    html = notifier._compose_down([t], monitor.now_utc(), "<b>banner</b>")[0][2]
+    assert "<img" not in html and "&lt;img" in html
+    assert "<b>banner" not in html
+
+
+def test_secrets_in_urls_are_masked_in_alerts(config):
+    notifier = monitor.EmailNotifier(config, dry_run=True)
+    t = transition("https://user:hunter2@a.example.com/health?api_key=SECRET123&x=1")
+    _, body, html, _ = notifier._compose_down([t], monitor.now_utc(), None)[0]
+    assert "hunter2" not in body and "SECRET123" not in body
+    assert "hunter2" not in html and "SECRET123" not in html
+    assert "api_key=***" in body and "x=1" in body
+
+
+def test_nested_secrets_are_redacted():
+    text = monitor.redact({"detail": {"db_password": "hunter2", "ok": True},
+                           "items": [{"token": "abc"}]})
+    assert "hunter2" not in text and "abc" not in text and '"ok": true' in text
+
+
+def test_flapping_notice_names_the_targets_and_the_rule(config):
+    notifier = monitor.EmailNotifier(config, dry_run=True)
+    t = transition("https://photo.example.com")
+    t.flap_event, t.flapping, t.flap_changes, t.flap_failures, t.flap_checks = \
+        "start", True, 6, 3, 12
+    subject, body, html, key = notifier._compose_flap([t], monitor.now_utc(), None)
+    assert subject.startswith("[FLAPPING] photo.example.com")
+    assert "6 changes of state and 3 failed checks in its last 12 checks" in body
+    assert "lasted 15m" in body and key.startswith("FLAP:")
 
 
 def test_grouping_can_be_disabled(config):
